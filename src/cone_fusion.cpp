@@ -165,20 +165,6 @@ void ConeFusion::conesCallback(
 
   free(z);
 
-  /* Get vehicle pose */
-  Vector3f xytheta = this->ekf_odom->getState().head(3);
-
-  this->act_position << xytheta(0), xytheta(1), 0.0;
-
-  this->act_yaw = xytheta(2);
-
-  tf2::Quaternion q;
-  q.setRPY(0.0, 0.0, this->act_yaw);
-  this->act_orientation.set__x(q.getX());
-  this->act_orientation.set__y(q.getY());
-  this->act_orientation.set__z(q.getZ());
-  this->act_orientation.set__w(q.getW());
-
   /* Publish cones */
   if (!this->corrected_cones_created || this->cones_pub_for_debug) {
     size_t mapped_cones = this->ekf_odom->getActMappedLandmarks();
@@ -224,10 +210,6 @@ void ConeFusion::conesCallback(
     conesMarker.colors.clear();
   } else {
     this->pubConesMarkers(correctedConesMarker);
-  }
-
-  if(!this->corrected_cones_created){ // redundant check, but it's fine
-    this->updatePose();
   }
 }
 
@@ -282,12 +264,16 @@ void ConeFusion::fastLimoDataCallback(
   this->ekf_odom->setPose(pose);
   this->ekf_odom->setPoseCovariance(pose_cov);
 
+  /* Publish the EKF state (corrected by the cones), NOT the raw FAST-LIMO pose.
+     This is what lets the cone corrections survive on the wire. */
+  Vector3f ekf_pose = this->ekf_odom->getState().head(3);
+
   /* If this is the second lap, retrieve ONLY vehicle position, and publish
    * already mapped cones. */
   if (this->corrected_cones_created || this->is_skidpad_mission) {
     /* Get vehicle pose */
-    this->act_position << pose(0), pose(1), 0.0;
-    this->act_yaw = pose(2);
+    this->act_position << ekf_pose(0), ekf_pose(1), 0.0;
+    this->act_yaw = ekf_pose(2);
 
     tf2::Quaternion q;
     q.setRPY(0.0, 0.0, this->act_yaw);
@@ -304,8 +290,8 @@ void ConeFusion::fastLimoDataCallback(
   }else{
     /* If this is the first lap, just publish FAST-LIMO pose and cones position if
      * seen. */
-    this->act_position << pose(0), pose(1), 0.0;
-    this->act_yaw = pose(2);
+    this->act_position << ekf_pose(0), ekf_pose(1), 0.0;
+    this->act_yaw = ekf_pose(2);
 
     tf2::Quaternion q;
     q.setRPY(0.0, 0.0, this->act_yaw);

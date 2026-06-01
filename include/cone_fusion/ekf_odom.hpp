@@ -39,6 +39,11 @@ private:
 
     bool is_pose_initialized = false;  /* Bool to check if an initial pose has been set */
 
+    Eigen::Vector3f prev_limo_pose_ = Eigen::Vector3f::Zero();  /* Last FAST-LIMO pose, used to compute the relative motion increment in setPose */
+
+    Eigen::Vector3f prev_limo_cov_ = Eigen::Vector3f::Zero();   /* Last FAST-LIMO pose covariance, used to compute the covariance increment in setPoseCovariance */
+    bool is_cov_initialized = false;  /* Bool to check if the first FAST-LIMO covariance has been recorded */
+
     bool is_first_lap_completed = false; /* Bool to understand if the first lap is completed. In that case, do not map any new cone */
 
 public:

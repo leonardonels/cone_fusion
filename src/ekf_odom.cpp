@@ -113,7 +113,7 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
             continue;   
         }
 
-        bool is_new_cone = false;
+        // bool is_new_cone = false;
         /* Reset min distance and k index */
         min_dist = __FLT_MAX__;
         k = 0;
@@ -153,7 +153,7 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                 continue;   
             }
             /* New cone */
-            is_new_cone = true;
+            // is_new_cone = true;
 
             // std::cerr << "EKF INDEX: " << i << " NEW CONE!!\n";
             k = this->landmark_count;
@@ -223,6 +223,12 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
             K = this->P_ * Ht_k.transpose() * (((Ht_k * this->P_ * Ht_k.transpose()) + this->Q_).inverse());
 
             Vector2f meas_diff = Vector2f(z[i](0), z[i](1)) - exp_z_k;
+            /* First lap: let the cones be mapped/refined, but do NOT let them move the
+               vehicle pose yet (sparse, immature map → noisy pose corrections). Anchor
+               only from lap 2, when the map is frozen and reliable. */
+            if (!this->is_first_lap_completed) {
+                K.topRows(3).setZero();
+            }
             /* Update filter state */
             this->x_.noalias() += (K * meas_diff);
             this->x_(2) = this->normalizeYaw(this->x_(2));
@@ -287,16 +293,59 @@ void EKFOdom::setActAngVel(const float ang_vel)
 
 void EKFOdom::setPose(const Vector3f pose)
 {
-    this->x_.segment(0,3) = pose;
-    this->is_pose_initialized = true;
+    /* First FAST-LIMO frame: do NOT seed the EKF pose from LIMO. The EKF frame
+       is anchored at the track origin (x_ starts at 0), and LIMO is used purely
+       as a relative motion source, so here we only record the first frame as the
+       reference for the next delta. */
+    if (!this->is_pose_initialized)
+    {
+        this->prev_limo_pose_ = pose;
+        this->is_pose_initialized = true;
+        return;
+    }
+
+    /* Relative motion of FAST-LIMO since the previous frame, expressed in the
+       previous LIMO body frame. */
+    float dx = pose(0) - this->prev_limo_pose_(0);
+    float dy = pose(1) - this->prev_limo_pose_(1);
+    float prev_theta = this->prev_limo_pose_(2);
+
+    float local_dx =  cos(prev_theta) * dx + sin(prev_theta) * dy;
+    float local_dy = -sin(prev_theta) * dx + cos(prev_theta) * dy;
+    float dtheta   =  normalizeAngle(pose(2) - prev_theta);
+
+    /* Compose the relative motion onto the (cone-corrected) EKF pose, so the
+       correction applied by correct() is preserved instead of overwritten. */
+    float etheta = this->x_(2);
+    this->x_(0) += cos(etheta) * local_dx - sin(etheta) * local_dy;
+    this->x_(1) += sin(etheta) * local_dx + cos(etheta) * local_dy;
+    this->x_(2)  = normalizeYaw(etheta + dtheta);
+
+    this->prev_limo_pose_ = pose;
 }
 
 void EKFOdom::setPoseCovariance(const Vector3f pos_cov)
 {
-    for (size_t i=0; i < 3; i++)
+    /* First frame: just record the reference covariance, add nothing. */
+    if (!this->is_cov_initialized)
     {
-        this->P_(i,i) += pos_cov(i);
+        this->prev_limo_cov_ = pos_cov;
+        this->is_cov_initialized = true;
+        return;
     }
+
+    /* Relative model: inflate the pose covariance only by the INCREMENT of
+       LIMO's own covariance over this step, not by its absolute value. This
+       mirrors using LIMO's relative motion for the mean (setPose). correct()
+       then shrinks it back when cones anchor the pose. The increment is clamped
+       to >= 0 since LIMO's covariance can occasionally drop (e.g. its own
+       relocalisation), which must not shrink the EKF covariance here. */
+    for (size_t i = 0; i < 3; i++)
+    {
+        float d = pos_cov(i) - this->prev_limo_cov_(i);
+        this->P_(i,i) += (d > 0.0f) ? d : 0.0f;
+    }
+    this->prev_limo_cov_ = pos_cov;
 }
 
 size_t EKFOdom::getActMappedLandmarks() const
