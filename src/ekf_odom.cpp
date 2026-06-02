@@ -102,8 +102,6 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
     // VectorXf new_state_update = VectorXf::Zero(2*N_CONES+3);
     // MatrixXf new_covariance_update = MatrixXf::Zero(2*N_CONES+3, 2*N_CONES+3);
 
-    MatrixXf Ip = MatrixXf::Identity(2*N_CONES + 3, 2*N_CONES + 3);
-
     for(i = 0; i < act_cones_detected; i++)
     {
         /* Discard orange cones */
@@ -195,11 +193,18 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                 // std::cerr << "EKF INDEX: " << i << " EXPC z is: \n" << exp_z_k << "\n";
             // }
 
-            /* Set to 1 the elements of the matrix Fx_k corresponding to the actual cone */
-            this->Fx_k.setConstant(0);
-            this->Fx_k.block(0,0,3,3) = Matrix3f::Identity();
+            /* Work only on the active sub-block of the state: pose (3) + mapped
+               landmarks (2*landmark_count). Inactive landmarks are decoupled
+               (P = INF*I, zero cross-covariance), so they are neither correlated
+               nor corrected here — including them in the matrix products is
+               wasted compute. */
+            const size_t na = 3 + 2 * this->landmark_count;
 
-            this->Fx_k.block(3,3 + 2*(k),2,2) = Matrix2f::Identity();
+            /* Fx_k maps the 5-dim [pose, landmark_k] block onto the active
+               state, sized (5, na). */
+            MatrixXf Fx_k_a = MatrixXf::Zero(5, na);
+            Fx_k_a.block(0,0,3,3) = Matrix3f::Identity();
+            Fx_k_a.block(3, 3 + 2*k, 2, 2) = Matrix2f::Identity();
 
             MatrixXf ht_k = MatrixXf::Zero(2,5);
             ht_k(0,0) = -sqrt(q_k) * delta_k(0);
@@ -214,13 +219,16 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
             ht_k(1,3) = -delta_k(1);
             ht_k(1,4) = delta_k(0);
 
-            /* Ht_k size: (2, 2N + 3)*/
-            MatrixXf Ht_k;
-            Ht_k = ((1 / q_k) * ht_k) * Fx_k;
+            /* Ht_k size: (2, na) */
+            MatrixXf Ht_k = ((1 / q_k) * ht_k) * Fx_k_a;
 
-            /* Compute Kalman Gain. K size: (2N+3, 2) */
-            MatrixXf K;
-            K = this->P_ * Ht_k.transpose() * (((Ht_k * this->P_ * Ht_k.transpose()) + this->Q_).inverse());
+            /* Active covariance block (na x na). */
+            auto P_a = this->P_.topLeftCorner(na, na);
+
+            /* Innovation covariance S (2x2) and Kalman gain K (na x 2). */
+            MatrixXf HtP = Ht_k * P_a;                          /* (2 x na) */
+            Matrix2f S = (HtP * Ht_k.transpose()) + this->Q_;
+            MatrixXf K = P_a * Ht_k.transpose() * S.inverse();  /* (na x 2) */
 
             Vector2f meas_diff = Vector2f(z[i](0), z[i](1)) - exp_z_k;
             /* First lap: let the cones be mapped/refined, but do NOT let them move the
@@ -229,15 +237,15 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
             if (!this->is_first_lap_completed) {
                 K.topRows(3).setZero();
             }
-            /* Update filter state */
-            this->x_.noalias() += (K * meas_diff);
-            this->x_(2) = this->normalizeYaw(this->x_(2));
-            // new_state_update = (K * meas_diff);
-            // new_covariance_update = (K * Ht_k);
 
-            /* Update filter covariance */
-            Ip.noalias() -= (K * Ht_k).eval();
-            this->P_ =  Ip * this->P_;
+            /* Update filter state (active part only). */
+            this->x_.head(na).noalias() += (K * meas_diff);
+            this->x_(2) = this->normalizeYaw(this->x_(2));
+
+            /* Update filter covariance in O(na^2): P -= K * (Ht_k * P).
+               Equivalent to (I - K*Ht_k)*P but without forming the full
+               (I - K*Ht_k) matrix nor an n x n product. */
+            P_a.noalias() -= K * HtP;
 
         }
     }
@@ -314,11 +322,32 @@ void EKFOdom::setPose(const Vector3f pose)
     float local_dy = -sin(prev_theta) * dx + cos(prev_theta) * dy;
     float dtheta   =  normalizeAngle(pose(2) - prev_theta);
 
-    /* Compose the relative motion onto the (cone-corrected) EKF pose, so the
-       correction applied by correct() is preserved instead of overwritten. */
+    /* World-frame displacement applied to the EKF pose (R(theta) * local). */
     float etheta = this->x_(2);
-    this->x_(0) += cos(etheta) * local_dx - sin(etheta) * local_dy;
-    this->x_(1) += sin(etheta) * local_dx + cos(etheta) * local_dy;
+    float dwx = cos(etheta) * local_dx - sin(etheta) * local_dy;
+    float dwy = sin(etheta) * local_dx + cos(etheta) * local_dy;
+
+    /* Covariance propagation through the motion Jacobian (predict step):
+       P <- G P G^T, with G = I except the 3x3 pose block. G couples the heading
+       uncertainty into the position covariance and rotates the pose-landmark
+       cross-covariances; without it the pose covariance would only grow on its
+       diagonal (in setPoseCovariance) and corrections would distribute badly
+       between x, y and theta. The additive process noise Q_motion is added
+       afterwards in setPoseCovariance. Only the active sub-block is touched
+       (inactive landmarks are decoupled). */
+    Matrix3f G = Matrix3f::Identity();
+    G(0,2) = -dwy;   /* d f_x / d theta = -sin(theta)*lx - cos(theta)*ly = -dwy */
+    G(1,2) =  dwx;   /* d f_y / d theta =  cos(theta)*lx - sin(theta)*ly =  dwx */
+
+    const size_t na = 3 + 2 * this->landmark_count;
+    auto Pa = this->P_.topLeftCorner(na, na);
+    Pa.topRows(3)  = (G * Pa.topRows(3)).eval();              /* rows: G * P    */
+    Pa.leftCols(3) = (Pa.leftCols(3) * G.transpose()).eval(); /* cols: P * G^T  */
+
+    /* Compose the relative motion onto the (cone-corrected) EKF pose mean, so the
+       correction applied by correct() is preserved instead of overwritten. */
+    this->x_(0) += dwx;
+    this->x_(1) += dwy;
     this->x_(2)  = normalizeYaw(etheta + dtheta);
 
     this->prev_limo_pose_ = pose;

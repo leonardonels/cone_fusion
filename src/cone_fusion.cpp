@@ -156,9 +156,12 @@ void ConeFusion::conesCallback(
 
   rclcpp::Time start, end;
   start = this->now();
+
   this->ekf_odom->correct(z, detected_cones);
+
   end = this->now();
   rclcpp::Duration exe_time = end - start;
+  
   if (this->enable_logging)
     RCLCPP_INFO(this->get_logger(), "CORRECT Exe time (ms): %lf",
                 exe_time.nanoseconds() * 1e-6);
@@ -194,9 +197,9 @@ void ConeFusion::conesCallback(
       conesMarker.colors.push_back(c);
     }
 
-    if (this->race_status.current_lap > 1) {
+    if (this->race_status.current_lap > 1 && !this->corrected_cones_created) {
       this->ekf_odom->setFirstLapCompleted(true);
-      RCLCPP_INFO(this->get_logger(), "CREATING CORRECTED CONES");
+      RCLCPP_INFO(this->get_logger(), "Creating corrected cones markers with %zu cones", conesMarker.points.size());
       this->corrected_cones_created = true;
       this->corrected_cones_size = mapped_cones;
       this->correctedConesMarker = conesMarker;
@@ -282,10 +285,6 @@ void ConeFusion::fastLimoDataCallback(
     this->act_orientation.set__z(q.getZ());
     this->act_orientation.set__w(q.getW());
 
-    if (!this->is_skidpad_mission) {
-      this->pubConesMarkers(correctedConesMarker);
-    }
-
     this->updatePose();
   }else{
     /* If this is the first lap, just publish FAST-LIMO pose and cones position if
@@ -307,6 +306,7 @@ void ConeFusion::fastLimoDataCallback(
 void ConeFusion::pubConesMarkers(visualization_msgs::msg::Marker &cones) {
   cones.header.stamp = this->now();
   this->conesPositionsMarkerPub->publish(cones);
+  std::cout << "Published " << cones.points.size() << " cones.\n";
 }
 
 void ConeFusion::updatePose() {
