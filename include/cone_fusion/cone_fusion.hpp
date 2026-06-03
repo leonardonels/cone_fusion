@@ -76,6 +76,10 @@ private:
   /* If true, the EKF fuses all cones of a scan in one joint update (vs. only the last) */
   bool batch_cone_update = false;
 
+  /* If true (default), lap 2+ freezes the map (rigid pose-only localization); if
+     false, lap 2+ keeps refining pose AND landmarks (continuous SLAM, legacy) */
+  bool freeze_map = true;
+
   /* Chi-square (2 DOF) gate for lap-2+ data association by Mahalanobis distance */
   double assoc_maha_gate = 9.21;
 

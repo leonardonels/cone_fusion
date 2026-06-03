@@ -296,6 +296,16 @@ formulations** of the update depending on the lap:
   landmarks too would let small biases **slowly rotate** the whole map after a few laps. From
   lap 2 no more cones are added.
 
+**Optional: continuous SLAM (`freeze_map: false`).** The lap-2 rigid-map behavior above is the
+default and is selected by `generic.freeze_map: true`. Setting it to **`false`** makes lap 2+
+keep doing the **full-state** update (the same path as lap 1 but **without** the pose freeze),
+so pose **and** landmark positions are corrected continuously — the legacy behavior. This
+refines the map every lap, at the cost of re-opening the gauge: small biases can make the whole
+map **slowly rotate** over many laps (exactly the failure the rigid mode was introduced to
+prevent). No *new* cones are added after lap 1 in either mode; "continuous" only refines the
+positions of cones already mapped in lap 1. Use `false` for A/B comparison or short runs where
+map refinement matters more than long-horizon gauge stability; keep `true` for multi-lap races.
+
 ### Lap-1 → lap-2 handoff
 During lap 1 the pose accumulates the **FAST-LIMO drift** and $P_{pp}$ **grows** (the pose is
 frozen, so no correction shrinks it). At the transition to lap 2 the cones start correcting the
@@ -348,6 +358,7 @@ well if `N_CONES` is increased.
 | `generic.cones_pub_for_debug` | `true` → publishes the EKF's **live** map even after lap 1 (debug). `false` → publishes the **frozen** map. | Keep `false` in a race. In debug, remember the live one moves (the associated cones are still corrected by the filter). |
 | `generic.pub_input_cones_debug` | `true` → publishes on `input_cones_debug_topic` the raw input cones projected into the map frame with the current EKF pose (**red** markers). | Debug tool: the red ones should land on the mapped cones; if they "slide away" the pose is drifting. Keep `false` in a race. |
 | `generic.batch_cone_update` | Correction mode (§4.5). `false` → update on the last cone/scan only (default, cheap, stable). `true` → **joint** update over all associated cones (more information, less "nervous" pose). | Leave `false` as baseline; set `true` for the A/B test. If the pose becomes unstable in batch, raise `noises.proc_noise` (the $Q$ in $S$): the joint update is more aggressive because it fuses more measurements. |
+| `generic.freeze_map` | Map handling from lap 2 (§5). `true` (default) → **rigid map**: pose-only localization, landmarks fixed, gauge locked (no slow map rotation). `false` → **continuous SLAM**: keep correcting pose *and* landmark positions (legacy; refines the map but can let it slowly rotate over laps). No new cones are added after lap 1 either way. | Keep `true` for multi-lap races (gauge stability). Use `false` only for A/B tests or short runs where map refinement matters more than long-horizon stability. If you enable it and the map starts rotating after a few laps, that's the expected gauge drift — switch back to `true`. |
 | `generic.is_colorblind` | `true` → all cones treated as yellow (color ignored in association). | Leave `true` if the color from the perceptor is unreliable. |
 | `generic.is_skidpad_mission` | Skidpad mode: publishes pose only, no cone markers. | `false` for missions with cone mapping. |
 | `N_CONES` (compile-time, `ekf_odom.hpp`) | Maximum landmark capacity. Increasing it enlarges the matrices (cost $\propto N$ on the inactive block, but `correct()` only works on $n_a$). | Raise if the track has more than ~400 cones. |
@@ -382,11 +393,13 @@ well if `N_CONES` is increased.
   scan) **diverges** — it shrinks $\mathbf{P}$ by ~$M$ times per scan, making the filter
   overconfident: that's why the fusion is done in **joint** form (a single covariance
   reduction), not sequentially.
-- **Single-lap map**: with the rigid anchor from lap 2 (§5) the map is the one built in lap 1
-  **only** and is no longer refined. It's a deliberate trade-off (it fixes the gauge and
-  eliminates the slow map rotation), but any lap-1 mapping errors remain: if lap 1 is noisy,
+- **Single-lap map** (default): with the rigid anchor from lap 2 (§5) the map is the one built
+  in lap 1 **only** and is no longer refined. It's a deliberate trade-off (it fixes the gauge
+  and eliminates the slow map rotation), but any lap-1 mapping errors remain: if lap 1 is noisy,
   it's better to improve detection/association upstream than to reopen the landmark corrections
-  (which would reintroduce the rotational drift).
+  (which would reintroduce the rotational drift). This can be toggled with
+  `generic.freeze_map: false` to re-enable continuous landmark refinement, accepting the gauge
+  drift as the cost — see §5.
 - **`predict()` disconnected**: the velocity model is dormant code.
 - **Dead member `Fx_k`**: replaced by the local `Fx_k_a` in `correct()`; removable.
 - **Inverted noise naming** and used as variance: see §6.

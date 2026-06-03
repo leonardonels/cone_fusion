@@ -28,6 +28,15 @@
       # true = joint update fusing all associated cones in one EKF step (A/B test).
       batch_cone_update: true
 
+      # Map handling from lap 2 onward:
+      #   true  = freeze the map: rigid pose-only localization (landmarks fixed,
+      #           global gauge locked, no slow map rotation). Recommended.
+      #   false = continuous SLAM: keep correcting pose AND landmark positions
+      #           (legacy behavior; refines the map but can let it slowly rotate).
+      # Note: no NEW cones are added after lap 1 in either mode; "continuous" only
+      # refines the positions of cones already mapped in lap 1.
+      freeze_map: false
+
       # Lap-2+ data association: a cone associates to the nearest mapped landmark
       # only if its Mahalanobis distance d^2 = nu^T S^-1 nu is below this gate
       # (chi-square, 2 DOF: 5.99=95%, 9.21=99%, 13.8=99.9%). Replaces the fixed

@@ -265,13 +265,16 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                pose when a cone is re-observed across the wrap. */
             meas_diff(1) = normalizeAngle(meas_diff(1));
 
-            if (!this->is_first_lap_completed)
+            if (!(this->is_first_lap_completed && this->freeze_map_))
             {
-                /* LAP 1: full-state EKF update on the active sub-block (pose +
+                /* FULL-STATE EKF-SLAM update on the active sub-block (pose +
                    mapped landmarks; inactive landmarks are decoupled, so they are
-                   excluded from the products). Build/refine the map, but FREEZE
-                   the pose (zero its gain rows) — the map is still sparse and
-                   immature, so pose corrections would be noisy. */
+                   excluded from the products). Used in lap 1 (mapping) and, when
+                   freeze_map_ is false, in lap 2+ as well (continuous SLAM: pose
+                   AND landmarks keep being corrected — the legacy behavior, which
+                   refines the map but can let the global-rotation gauge drift).
+                   The pose is FROZEN (gain rows zeroed) only during lap 1, where
+                   the map is still sparse/immature; from lap 2 it is corrected. */
                 const size_t na = 3 + 2 * this->landmark_count;
 
                 MatrixXf Fx_k_a = MatrixXf::Zero(5, na);
@@ -285,7 +288,8 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                 Matrix2f S = (HtP * Ht_k.transpose()) + this->Q_;
                 MatrixXf K = P_a * Ht_k.transpose() * S.inverse();
 
-                K.topRows(3).setZero();                         /* freeze pose */
+                if (!this->is_first_lap_completed)
+                    K.topRows(3).setZero();                     /* freeze pose (lap 1 only) */
 
                 this->x_.head(na).noalias() += (K * meas_diff);
                 this->x_(2) = this->normalizeYaw(this->x_(2));
@@ -293,13 +297,13 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
             }
             else
             {
-                /* LAP 2+: RIGID-MAP localization update. The map is now a fixed,
-                   known reference: treat landmark k as a constant and update ONLY
-                   the 3-DoF pose. A clean pose-only update (rather than zeroing
-                   the landmark rows of a full-state gain) keeps P consistent — no
-                   asymmetric gain truncation — and fixes the global-rotation
-                   gauge, so the map neither drifts nor rotates over laps and the
-                   pose is not snapped by a contaminated gain. */
+                /* LAP 2+ (freeze_map_): RIGID-MAP localization update. The map is
+                   now a fixed, known reference: treat landmark k as a constant and
+                   update ONLY the 3-DoF pose. A clean pose-only update (rather than
+                   zeroing the landmark rows of a full-state gain) keeps P
+                   consistent — no asymmetric gain truncation — and fixes the
+                   global-rotation gauge, so the map neither drifts nor rotates over
+                   laps and the pose is not snapped by a contaminated gain. */
                 Matrix<float,2,3> H_p = ht_k.leftCols(3);
                 auto P_pp = this->P_.topLeftCorner(3,3);
 
@@ -373,10 +377,12 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                 R.block(2*r, 2*r, 2, 2) = this->Q_;
             }
 
-            if (!this->is_first_lap_completed)
+            if (!(this->is_first_lap_completed && this->freeze_map_))
             {
-                /* LAP 1: full-state joint update — build/refine the map, freeze
-                   the pose. H is sparse: each cone touches pose + its landmark. */
+                /* FULL-STATE joint update — build/refine the map. Used in lap 1
+                   (mapping) and, when freeze_map_ is false, in lap 2+ too
+                   (continuous SLAM). H is sparse: each cone touches pose + its
+                   landmark. The pose is frozen only during lap 1. */
                 auto P_a = this->P_.topLeftCorner(na, na);
 
                 MatrixXf H = MatrixXf::Zero(2*m, na);
@@ -390,7 +396,8 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                 MatrixXf S  = (HP * H.transpose()) + R;          /* (2m x 2m)  */
                 MatrixXf K  = P_a * H.transpose() * S.inverse(); /* (na x 2m)  */
 
-                K.topRows(3).setZero();                          /* freeze pose */
+                if (!this->is_first_lap_completed)
+                    K.topRows(3).setZero();                      /* freeze pose (lap 1 only) */
 
                 this->x_.head(na).noalias() += (K * nu_all);
                 this->x_(2) = this->normalizeYaw(this->x_(2));
@@ -398,10 +405,10 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
             }
             else
             {
-                /* LAP 2+: RIGID-MAP joint localization. Treat the map as fixed and
-                   update ONLY the pose, using just the pose columns of each
-                   Jacobian. Consistent P (3x3 block), no gauge drift, no snap from
-                   a truncated gain. */
+                /* LAP 2+ (freeze_map_): RIGID-MAP joint localization. Treat the map
+                   as fixed and update ONLY the pose, using just the pose columns of
+                   each Jacobian. Consistent P (3x3 block), no gauge drift, no snap
+                   from a truncated gain. */
                 auto P_pp = this->P_.topLeftCorner(3,3);
 
                 MatrixXf Hp = MatrixXf::Zero(2*m, 3);
@@ -464,6 +471,10 @@ void EKFOdom::setFirstLapCompleted(const bool first_lap_completed)
 void EKFOdom::setBatchUpdate(const bool enable)
 {
     this->batch_update_ = enable;
+}
+void EKFOdom::setFreezeMap(const bool enable)
+{
+    this->freeze_map_ = enable;
 }
 void EKFOdom::setAssocMahaGate(const float gate)
 {

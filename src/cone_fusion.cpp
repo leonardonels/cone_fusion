@@ -28,6 +28,7 @@ ConeFusion::ConeFusion() : rclcpp::Node("cone_fusion_node") {
   /* Create EKF SLAM filter object */
   this->ekf_odom = std::make_shared<EKFOdom>(this->proc_noise, this->meas_noise, this->motion_noise, this->min_new_cone_distance);
   this->ekf_odom->setBatchUpdate(this->batch_cone_update);
+  this->ekf_odom->setFreezeMap(this->freeze_map);
   this->ekf_odom->setAssocMahaGate(static_cast<float>(this->assoc_maha_gate));
 
   /* Init mapped cones markers */
@@ -67,6 +68,9 @@ void ConeFusion::loadParameters() {
   /* Joint (batch) cone update vs. single-cone-per-scan update */
   declare_parameter("generic.batch_cone_update", false);
 
+  /* Freeze the map from lap 2 (rigid pose-only localization) vs. continuous SLAM */
+  declare_parameter("generic.freeze_map", true);
+
   /* Chi-square (2 DOF) gate for lap-2+ Mahalanobis data association */
   declare_parameter("generic.assoc_maha_gate", 9.21);
 
@@ -100,6 +104,7 @@ void ConeFusion::loadParameters() {
   get_parameter("generic.pub_input_cones_debug", this->pub_input_cones_debug);
 
   get_parameter("generic.batch_cone_update", this->batch_cone_update);
+  get_parameter("generic.freeze_map", this->freeze_map);
   get_parameter("generic.assoc_maha_gate", this->assoc_maha_gate);
 
   std::cout << "IS_SKIDPAD: " << this->is_skidpad_mission << "\n";

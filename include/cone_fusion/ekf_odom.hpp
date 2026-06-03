@@ -48,6 +48,8 @@ private:
 
     bool batch_update_ = false; /* If true, correct() fuses ALL cones associated in a scan in one joint EKF update instead of only the last one */
 
+    bool freeze_map_ = true; /* If true (default), lap 2+ does a rigid-map pose-only update (landmarks fixed, gauge locked). If false, lap 2+ keeps doing a full-state SLAM update (pose AND landmarks corrected continuously). */
+
     float assoc_maha_gate_ = 9.21f; /* chi-square (2 DOF) gate for lap-2+ data association by Mahalanobis distance */
 
     float q_motion_pos_ = 0.0f; /* Additive process noise on x,y per metre travelled [m^2/m]. Keeps P from collapsing so the assoc gate stays honest. 0 = off. */
@@ -84,6 +86,7 @@ public:
 
     void setFirstLapCompleted(const bool first_lap_completed);
     void setBatchUpdate(const bool enable);
+    void setFreezeMap(const bool enable);
     void setAssocMahaGate(const float gate);
     void setActVel(const float vel);
     void setActAngVel(const float ang_vel);
