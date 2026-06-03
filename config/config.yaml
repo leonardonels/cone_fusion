@@ -2,39 +2,55 @@
   ros__parameters:
     generic:
       is_colorblind: true
+      
+      output_frame_id: "track"
+      output_child_frame_id: "imu_link"
 
+      imu_topic: "/imu/data"  # or /lidar_imu       # WIP
       cones_topic: "/clusters"
-      cones_frame_id: "hesai_lidar"
+      input_odom_topic: "/fast_limo/state"
+      race_status_topic: "/planning/race_status"
       
       mapped_cones_topic: "/slam/cones_positions"
-      mapped_cones_frame_id: "track"
-      
-      imu_topic: "/imu/data"  # or /lidar_imu
-      
-      input_odom_topic: "/fast_limo/state"
-      input_odom_frame_id: "track"
-
       output_odom_topic: "/Odometry"
-      output_odom_frame_id: "track"
-      output_odom_child_frame_id: "imu_link"
 
-      # gps_speed_topic: "/speed/gps"
-      race_status_topic: "/planning/race_status"
       enable_logging: true
-      cone_time_seen_th: 4
+      cone_time_seen_th: 10
       is_skidpad_mission: false
       cones_pub_for_debug: true
 
-      # False-positive rejection: a mapped cone is published only if it is
-      # detected on a large enough fraction of the passes it is actually visible.
-      lidar_max_range: 20.0      # Max range [m] within which a cone is expected to be detected
-      lidar_fov: 180.0           # Horizontal field of view [deg] (full angle)
-      cone_confidence_th: 0.3    # Min detected/expected ratio [0..1] to publish a cone
+      # Debug: publish the raw input cones projected into the map frame via the
+      # current EKF pose, as RED markers, to compare live observations vs. the map.
+      pub_input_cones_debug: true
+      input_cones_debug_topic: "/slam/input_cones_debug"
 
-    frequency:
-      imu_fs: 100
+      # Cone correction mode: false = single cone/scan (default, cheap, stable);
+      # true = joint update fusing all associated cones in one EKF step (A/B test).
+      batch_cone_update: true
+
+      # Smooth the lap-1 -> lap-2 anchor handoff: ramp the pose correction in over
+      # this many cone-correction scans, so accumulated lap-1 drift is realigned
+      # gradually instead of snapping. 0 = instant, trust fast_limo.
+      anchor_ramp_scans: 100
+
+      # Lap-2+ data association: a cone associates to the nearest mapped landmark
+      # only if its Mahalanobis distance d^2 = nu^T S^-1 nu is below this gate
+      # (chi-square, 2 DOF: 5.99=95%, 9.21=99%, 13.8=99.9%). Replaces the fixed
+      # Euclidean radius so the capture region adapts to pose uncertainty. Raise
+      # to keep correcting under larger drift; lower to reject more aggressively.
+      assoc_maha_gate: 13.8 
 
     noises:
-      proc_noise:  [0.3, 0.1]             # Sigma range [m] and bearing [rad]
+      proc_noise:  [0.3, 0.2]             # Sigma range [m] and bearing [rad]
       # meas_noise:  [0.02, 0.02, 0.07]     # Gaussian error of the odometry X,Y position [m] and Yaw angle [rad]
-      min_new_cone_distance: 2.0          # Minimum distance to create new cone
+
+      # Motion process noise (the Q of the predict step), added to the pose
+      # covariance each step proportional to motion: [pos per metre travelled
+      # [m^2/m], yaw per radian turned [rad^2/rad]]. This stops P from collapsing
+      # to ~0 over the laps (which makes the EKF overconfident in fast_limo and
+      # lets the Mahalanobis gate reject valid cones -> late-lap divergence).
+      # Raise if the gate starts rejecting good cones / drift accumulates; lower
+      # if the pose gets jittery. [0.0, 0.0] disables it.
+      motion_noise: [0.05, 0.02]
+
+      min_new_cone_distance: 1.7          # Minimum distance to create new cone

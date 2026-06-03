@@ -24,15 +24,18 @@ private:
   bool is_colorblind;
 
   /* Subscriptions topics' names */
-  std::string cones_topic, cones_frame_id, 
-      mapped_cones_topic, mapped_cones_frame_id, 
-      imu_topic, 
-      input_odom_topic, input_odom_frame_id, 
-      output_odom_topic, output_odom_frame_id, output_odom_child_frame_id,
-      gps_speed_topic, gps_data_topic, race_status_topic;
-    
+  std::string cones_topic, imu_topic, input_odom_topic, race_status_topic,
+      mapped_cones_topic, output_odom_topic, 
+      output_frame_id, output_child_frame_id,
+      // gps_speed_topic, gps_data_topic, 
+      input_cones_debug_topic;
+
   /* Debug parameter */
   bool cones_pub_for_debug;
+
+  /* If true, publish the raw input cones projected into the map frame via the
+     current EKF pose (red markers) for an input-vs-map visual check */
+  bool pub_input_cones_debug = false;
 
   /* Enable logging parameter */
   bool enable_logging;
@@ -70,15 +73,23 @@ private:
   /* Min number of time a cone has to be seen in order to map it */
   uint32_t cone_time_seen_th;
 
-  /* Sensor visibility model for cone false-positive rejection */
-  double lidar_max_range;    /* Max range [m] within which a mapped cone is expected to be detected */
-  double lidar_fov;          /* Horizontal field of view [deg] (full angle) */
-  double cone_confidence_th; /* Min detected/expected ratio [0..1] to publish a mapped cone */
+  /* If true, the EKF fuses all cones of a scan in one joint update (vs. only the last) */
+  bool batch_cone_update = false;
+
+  /* # cone-correction scans to ramp the pose anchor in from lap 2 (0 = instant snap) */
+  int anchor_ramp_scans = 0;
+
+  /* Chi-square (2 DOF) gate for lap-2+ data association by Mahalanobis distance */
+  double assoc_maha_gate = 9.21;
 
   /* EKF Parameters */
   Vector2f proc_noise;
   Vector3f meas_noise;
   double min_new_cone_distance;
+
+  /* Motion process noise: [x,y per metre travelled, theta per radian turned].
+     Keeps the pose covariance from collapsing so the assoc gate stays honest. */
+  Vector2f motion_noise;
 
   /* EKF SLAM filter object */
   std::shared_ptr<EKFOdom> ekf_odom;
@@ -89,6 +100,7 @@ private:
   /* ROS 2 Publishers */
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr conesPositionsMarkerPub;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr inputConesDebugPub;
 
   /* ROS 2 Subscribers */
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr fast_limo_odom_sub;
@@ -109,6 +121,10 @@ private:
   void initConesMarker(visualization_msgs::msg::Marker &cones);
   /* Method for publishing cones markers */
   void pubConesMarkers(visualization_msgs::msg::Marker &cones);
+
+  /* Debug: project raw input cones into the map frame (current EKF pose) and
+     publish them as red markers for an input-vs-map visual comparison */
+  void pubInputConesDebug(const visualization_msgs::msg::Marker::SharedPtr &cones_data);
 
   /* Method for updating vehicle pose */
   void updatePose();

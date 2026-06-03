@@ -7,6 +7,7 @@ ConeFusion::ConeFusion() : rclcpp::Node("cone_fusion_node") {
   /* Create publisher */
   this->odom_pub = this->create_publisher<nav_msgs::msg::Odometry>(this->output_odom_topic, 1);
   this->conesPositionsMarkerPub = this->create_publisher<visualization_msgs::msg::Marker>(this->mapped_cones_topic, 1);
+  this->inputConesDebugPub = this->create_publisher<visualization_msgs::msg::Marker>(this->input_cones_debug_topic, 1);
 
   /* Create subscriptions */
   this->cones_sub = this->create_subscription<visualization_msgs::msg::Marker>(this->cones_topic, 100,std::bind(&ConeFusion::conesCallback, this, std::placeholders::_1));
@@ -26,6 +27,10 @@ ConeFusion::ConeFusion() : rclcpp::Node("cone_fusion_node") {
 
   /* Create EKF SLAM filter object */
   this->ekf_odom = std::make_shared<EKFOdom>(this->proc_noise, this->meas_noise, this->min_new_cone_distance);
+  this->ekf_odom->setBatchUpdate(this->batch_cone_update);
+  this->ekf_odom->setAnchorRampScans(this->anchor_ramp_scans > 0 ? static_cast<size_t>(this->anchor_ramp_scans) : 0);
+  this->ekf_odom->setAssocMahaGate(static_cast<float>(this->assoc_maha_gate));
+  this->ekf_odom->setMotionNoise(this->motion_noise(0), this->motion_noise(1));
 
   /* Init mapped cones markers */
   this->initConesMarker(this->conesMarker);
@@ -37,76 +42,78 @@ ConeFusion::ConeFusion() : rclcpp::Node("cone_fusion_node") {
 }
 
 void ConeFusion::loadParameters() {
-  std::vector<double> tmp_proc_noise(2), tmp_meas_noise(3);
+  std::vector<double> tmp_proc_noise(2), tmp_meas_noise(3), tmp_motion_noise(2);
   declare_parameter("is_colorblind", true);
 
-  declare_parameter("generic.cones_topic", "/clusters");
-  declare_parameter("generic.cones_frame_id", "hesai_lidar");
+  declare_parameter("generic.output_frame_id", "track");
+  declare_parameter("generic.output_child_frame_id", "imu_link");
 
-  declare_parameter("generic.mapped_cones_topic", "/slam/cones_positions");
-  declare_parameter("generic.mapped_cones_frame_id", "track");
-  
   declare_parameter("generic.imu_topic", "/imu/data");
-  
+  declare_parameter("generic.cones_topic", "/clusters");
   declare_parameter("generic.input_odom_topic", "/fast_limo/state");
-  declare_parameter("generic.input_odom_frame_id", "track");
-
-  declare_parameter("generic.output_odom_topic", "/Odometry");
-  declare_parameter("generic.output_odom_frame_id", "track");
-  declare_parameter("generic.output_odom_child_frame_id", "imu_link");
-
-  declare_parameter("generic.gps_speed_topic", "/speed/gps");
-  declare_parameter("generic.gps_data_topic", "/gps/data");
   declare_parameter("generic.race_status_topic", "/planning/race_status");
+  // declare_parameter("generic.gps_speed_topic", "/speed/gps");
+  // declare_parameter("generic.gps_data_topic", "/gps/data");
+  
+  declare_parameter("generic.mapped_cones_topic", "/slam/cones_positions");
+  declare_parameter("generic.output_odom_topic", "/Odometry");
   
   declare_parameter("generic.enable_logging", false);
-  declare_parameter("generic.cone_time_seen_th", 2);
+  declare_parameter("generic.cone_time_seen_th", 10);
   declare_parameter("generic.is_skidpad_mission", false);
   declare_parameter("generic.cones_pub_for_debug", false);
 
-  /* Sensor visibility model for cone false-positive rejection */
-  declare_parameter("generic.lidar_max_range", 12.0);
-  declare_parameter("generic.lidar_fov", 120.0);
-  declare_parameter("generic.cone_confidence_th", 0.3);
+  declare_parameter("generic.input_cones_debug_topic", "/slam/input_cones_debug");
+  declare_parameter("generic.pub_input_cones_debug", false);
+
+  /* Joint (batch) cone update vs. single-cone-per-scan update */
+  declare_parameter("generic.batch_cone_update", false);
+
+  /* Smooth the lap-1 -> lap-2 anchor handoff over N correction scans (0 = instant) */
+  declare_parameter("generic.anchor_ramp_scans", 0);
+
+  /* Chi-square (2 DOF) gate for lap-2+ Mahalanobis data association */
+  declare_parameter("generic.assoc_maha_gate", 9.21);
 
   /* Declare Sensor Noise parameters */
   declare_parameter<std::vector<double>>("noises.proc_noise", std::vector<double>{0.0, 0.0});
   declare_parameter<std::vector<double>>("noises.meas_noise", std::vector<double>{0.0, 0.0, 0.0});
+  declare_parameter<std::vector<double>>("noises.motion_noise", std::vector<double>{0.0, 0.0});
   declare_parameter("noises.min_new_cone_distance", 2.0);
 
+  /* Get Parameters */
   get_parameter("is_colorblind", this->is_colorblind);
 
+  get_parameter("generic.output_frame_id", this->output_frame_id);
+  get_parameter("generic.output_child_frame_id", this->output_child_frame_id);
+
+  get_parameter("generic.imu_topic", this->imu_topic);
   get_parameter("generic.cones_topic", this->cones_topic);
-  get_parameter("generic.cones_frame_id", this->cones_frame_id);
+  get_parameter("generic.input_odom_topic", this->input_odom_topic);
+  get_parameter("generic.race_status_topic", this->race_status_topic);
+  // get_parameter("generic.gps_speed_topic", this->gps_speed_topic);
+  // get_parameter("generic.gps_data_topic", this->gps_data_topic);
   
   get_parameter("generic.mapped_cones_topic", this->mapped_cones_topic);
-  get_parameter("generic.mapped_cones_frame_id", this->mapped_cones_frame_id);
-  
-  get_parameter("generic.imu_topic", this->imu_topic);
-  
-  get_parameter("generic.input_odom_topic", this->input_odom_topic);
-  get_parameter("generic.input_odom_frame_id", this->input_odom_frame_id);
-  
   get_parameter("generic.output_odom_topic", this->output_odom_topic);
-  get_parameter("generic.output_odom_frame_id", this->output_odom_frame_id);
-  get_parameter("generic.output_odom_child_frame_id", this->output_odom_child_frame_id);
 
-  get_parameter("generic.gps_speed_topic", this->gps_speed_topic);
-  get_parameter("generic.gps_data_topic", this->gps_data_topic);
-  get_parameter("generic.race_status_topic", this->race_status_topic);
   get_parameter("generic.enable_logging", this->enable_logging);
   get_parameter("generic.is_skidpad_mission", this->is_skidpad_mission);
   get_parameter("generic.cones_pub_for_debug", this->cones_pub_for_debug);
 
-  get_parameter("generic.lidar_max_range", this->lidar_max_range);
-  get_parameter("generic.lidar_fov", this->lidar_fov);
-  get_parameter("generic.cone_confidence_th", this->cone_confidence_th);
+  get_parameter("generic.input_cones_debug_topic", this->input_cones_debug_topic);
+  get_parameter("generic.pub_input_cones_debug", this->pub_input_cones_debug);
+
+  get_parameter("generic.batch_cone_update", this->batch_cone_update);
+  get_parameter("generic.anchor_ramp_scans", this->anchor_ramp_scans);
+  get_parameter("generic.assoc_maha_gate", this->assoc_maha_gate);
 
   std::cout << "IS_SKIDPAD: " << this->is_skidpad_mission << "\n";
 
   /* Get Sensor Noise parameters */
   get_parameter("noises.proc_noise", tmp_proc_noise);
   get_parameter("noises.meas_noise", tmp_meas_noise);
+  get_parameter("noises.motion_noise", tmp_motion_noise);
   get_parameter("noises.min_new_cone_distance", this->min_new_cone_distance);
   get_parameter("generic.cone_time_seen_th", this->cone_time_seen_th);
 
@@ -115,13 +122,14 @@ void ConeFusion::loadParameters() {
   for (size_t i = 0; i < 3; i++) {
     if (i != 2) {
       this->proc_noise(i) = (float)tmp_proc_noise[i];
+      this->motion_noise(i) = (float)tmp_motion_noise[i];
     }
     this->meas_noise(i) = (float)tmp_meas_noise[i];
   }
 }
 
 void ConeFusion::initConesMarker(visualization_msgs::msg::Marker &cones) {
-  cones.header.frame_id = this->mapped_cones_frame_id;
+  cones.header.frame_id = this->output_frame_id;
   cones.ns = "ConesAbsolutePos";
   cones.id = 0;
   cones.type = visualization_msgs::msg::Marker::SPHERE_LIST;
@@ -164,25 +172,38 @@ void ConeFusion::conesCallback(const visualization_msgs::msg::Marker::SharedPtr 
   }
 
   rclcpp::Time start, end;
+  Vector3f pose_pre = this->ekf_odom->getState().head(3);
   start = this->now();
 
-  this->ekf_odom->correct(z, detected_cones);
+  size_t corrected = this->ekf_odom->correct(z, detected_cones);
 
   end = this->now();
   rclcpp::Duration exe_time = end - start;
-  
-  if (this->enable_logging)
-    RCLCPP_INFO(this->get_logger(), "CORRECT Exe time (ms): %lf",
-                exe_time.nanoseconds() * 1e-6);
+
+  if (this->enable_logging) {
+    /* Correction-health diagnostic: how many cones actually passed association
+       and got applied (corrected), the resulting pose move (|dpos|, |dyaw|), and
+       the current pose covariance. If "corrected" trends to 0 while P climbs and
+       |dpos| shrinks over the final laps, the corrections are dropping out (drift
+       cascade) rather than the covariance merely ratcheting. */
+    Vector3f pose_post = this->ekf_odom->getState().head(3);
+    const double dpos = std::hypot((double)(pose_post(0) - pose_pre(0)),
+                                   (double)(pose_post(1) - pose_pre(1)));
+    const double dyaw = std::fabs(this->ekf_odom->normalizeAngle(pose_post(2) - pose_pre(2)));
+    Vector3f pcov = this->ekf_odom->getPoseCovariance();
+    RCLCPP_INFO(this->get_logger(),
+                "scan: detected=%zu corrected=%zu |dpos|=%.4f |dyaw|=%.4f "
+                "Pxx=%.5f Pyy=%.5f Pyaw=%.5f exe_ms=%.3f",
+                detected_cones, corrected, dpos, dyaw,
+                pcov(0), pcov(1), pcov(2), exe_time.nanoseconds() * 1e-6);
+  }
 
   free(z);
 
-  /* Update per-landmark visibility (expected-detection) counters for this scan,
-     using the current pose estimate. Together with the per-detection counter,
-     this drives the detected/expected confidence ratio below. */
-  this->ekf_odom->updateLandmarkVisibility(
-      static_cast<float>(this->lidar_max_range),
-      static_cast<float>((this->lidar_fov * M_PI / 180.0) / 2.0));
+  /* Debug: project the raw input cones into the map frame via the current EKF
+     pose and publish them as red markers (input vs. map check). */
+  if (this->pub_input_cones_debug)
+    this->pubInputConesDebug(cones_data);
 
   /* Publish cones */
   if (!this->corrected_cones_created || this->cones_pub_for_debug) {
@@ -198,20 +219,8 @@ void ConeFusion::conesCallback(const visualization_msgs::msg::Marker::SharedPtr 
       /* Get the most-voted color and how many times the i-th cone was seen */
       std::pair<ColorId, uint32_t> cone_info = sigs(i).getConeColorAndCount();
 
-      /* Absolute floor: a cone must be detected at least cone_time_seen_th
-         times before it is eligible at all. */
-      const uint32_t detected = sigs(i).getDetected();
-      if (detected < cone_time_seen_th)
-        continue;
-
-      /* Detection-ratio gate: reject false positives that accumulate a few
-         detections spread thinly over many laps. A real cone is detected on
-         (almost) every pass it is within the sensor FOV/range, so its
-         detected/expected ratio is near 1; a ghost cone's ratio stays low. */
-      const uint32_t expected = sigs(i).getExpected();
-      const float confidence =
-          (expected > 0) ? (float)detected / (float)expected : 0.0f;
-      if (confidence < this->cone_confidence_th)
+      /* Only map cones seen at least cone_time_seen_th times */
+      if (cone_info.second < cone_time_seen_th)
         continue;
 
       Vector2f cone = state.segment(3 + (i * 2), 2);
@@ -336,14 +345,50 @@ void ConeFusion::pubConesMarkers(visualization_msgs::msg::Marker &cones) {
   this->conesPositionsMarkerPub->publish(cones);
 }
 
+void ConeFusion::pubInputConesDebug(
+    const visualization_msgs::msg::Marker::SharedPtr &cones_data) {
+  /* Current EKF pose: project the raw (vehicle-frame) input cones into the map
+     frame, so they can be overlaid on the mapped cones. global = pose_xy +
+     R(theta) * point. If the pose is good, red lands on the yellow map; if it
+     has drifted, red peels away — directly visualising input vs. map. */
+  Vector3f pose = this->ekf_odom->getState().head(3);
+  const double ct = cos(pose(2));
+  const double st = sin(pose(2));
+
+  visualization_msgs::msg::Marker dbg;
+  dbg.header.frame_id = this->output_frame_id;
+  dbg.header.stamp = this->now();
+  dbg.ns = "InputConesDebug";
+  dbg.id = 0;
+  dbg.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+  dbg.action = visualization_msgs::msg::Marker::ADD;
+  dbg.scale.x = dbg.scale.y = dbg.scale.z = 0.3;
+  dbg.pose.orientation.w = 1.0;
+  dbg.color.r = 1.0;
+  dbg.color.g = 0.0;
+  dbg.color.b = 0.0;
+  dbg.color.a = 1.0;
+  dbg.points.reserve(cones_data->points.size());
+
+  for (const auto &pt : cones_data->points) {
+    geometry_msgs::msg::Point p;
+    p.x = pose(0) + ct * pt.x - st * pt.y;
+    p.y = pose(1) + st * pt.x + ct * pt.y;
+    p.z = 0.0;
+    dbg.points.push_back(p);
+  }
+
+  this->inputConesDebugPub->publish(dbg);
+}
+
 void ConeFusion::updatePose() {
   geometry_msgs::msg::TransformStamped t;
   nav_msgs::msg::Odometry _odom;
 
   /* Update header */
   t.header.stamp = this->now();
-  t.header.frame_id = this->output_odom_frame_id;
-  t.child_frame_id = this->output_odom_child_frame_id;
+  t.header.frame_id = this->output_frame_id;
+  t.child_frame_id = this->output_child_frame_id;
 
   /* Update TF location */
   t.transform.translation.x = act_position[0];
@@ -354,8 +399,8 @@ void ConeFusion::updatePose() {
   t.transform.rotation = this->act_orientation;
 
   _odom.header.stamp = this->now();
-  _odom.header.frame_id = this->output_odom_frame_id;
-  _odom.child_frame_id = this->output_odom_child_frame_id;
+  _odom.header.frame_id = this->output_frame_id;
+  _odom.child_frame_id = this->output_child_frame_id;
 
   /* Update Odom position */
   _odom.pose.pose.position.x = act_position[0];
@@ -365,12 +410,19 @@ void ConeFusion::updatePose() {
   /* Update Odom orientation */
   _odom.pose.pose.orientation = this->act_orientation;
 
-  /* Update Odom covariance (just the main diagonal)*/
+  /* Update Odom covariance (just the main diagonal). Floor each variance at a
+     tiny positive value: the EKF covariance update P -= K(HP) is done in float,
+     so when strong cone corrections shrink the pose covariance, round-off can
+     push a diagonal entry slightly negative. A negative variance makes the
+     published covariance non-PSD (RViz: "Negative eigenvalue found for
+     position"). Flooring keeps what we publish valid without touching the
+     filter. */
+  constexpr double COV_FLOOR = 1e-9;
   Vector3f pose_cov = this->ekf_odom->getPoseCovariance();
 
-  _odom.pose.covariance.at(0) = pose_cov(0);  /* X Covariance */
-  _odom.pose.covariance.at(7) = pose_cov(1);  /* Y Covariance */
-  _odom.pose.covariance.at(35) = pose_cov(2); /* Yaw Covariance */
+  _odom.pose.covariance.at(0) = std::max((double)pose_cov(0), COV_FLOOR);  /* X Covariance */
+  _odom.pose.covariance.at(7) = std::max((double)pose_cov(1), COV_FLOOR);  /* Y Covariance */
+  _odom.pose.covariance.at(35) = std::max((double)pose_cov(2), COV_FLOOR); /* Yaw Covariance */
 
   this->tf_broadcaster_->sendTransform(t);
   this->odom_pub->publish(_odom);

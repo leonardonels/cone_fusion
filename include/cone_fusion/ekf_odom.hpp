@@ -46,6 +46,16 @@ private:
 
     bool is_first_lap_completed = false; /* Bool to understand if the first lap is completed. In that case, do not map any new cone */
 
+    bool batch_update_ = false; /* If true, correct() fuses ALL cones associated in a scan in one joint EKF update instead of only the last one */
+
+    size_t anchor_ramp_scans_ = 0; /* # of correction scans over which the cone anchor ramps in from lap 2 (0 = instant snap) */
+    size_t anchor_scans_ = 0;      /* counter of correction scans elapsed since the anchor became active */
+
+    float assoc_maha_gate_ = 9.21f; /* chi-square (2 DOF) gate for lap-2+ data association by Mahalanobis distance */
+
+    float q_motion_pos_ = 0.0f; /* Additive process noise on x,y per metre travelled [m^2/m]. Keeps P from collapsing so the assoc gate stays honest. 0 = off. */
+    float q_motion_yaw_ = 0.0f; /* Additive process noise on theta per radian turned [rad^2/rad]. 0 = off. */
+
 public:
     EKFOdom(Vector2f process_noise, Vector3f measurement_noise, const float alpha);
     virtual ~EKFOdom();
@@ -61,8 +71,10 @@ public:
      *  - actual bearing from vehicle to the landmark;
      *  - signature of the landmark;
      *  @param act_cones_detected: Number of actually observed landmarks
+     *  @return number of observations that passed data association (and thus
+     *          contributed to a correction) this scan — diagnostic.
     */
-    void correct(const Vector3f *z, const size_t act_cones_detected);
+    size_t correct(const Vector3f *z, const size_t act_cones_detected);
     
     VectorXf getState() const;
     MatrixXf getCovariance() const;
@@ -74,22 +86,14 @@ public:
     SignatureVector getSignatures() const;
 
     void setFirstLapCompleted(const bool first_lap_completed);
+    void setBatchUpdate(const bool enable);
+    void setAnchorRampScans(const size_t scans);
+    void setAssocMahaGate(const float gate);
+    void setMotionNoise(const float pos, const float yaw);
     void setActVel(const float vel);
     void setActAngVel(const float ang_vel);
     void setPose(const Vector3f pose);
     void setPoseCovariance(const Vector3f pos_cov);
-
-    /**
-     * Increment the "expected" (visibility) counter of every mapped landmark
-     * that currently falls within the sensor FOV/range, given the current pose
-     * estimate. Paired with the per-detection counter, this yields a
-     * detected/expected ratio used to reject false-positive cones that only
-     * match sporadically across laps.
-     *
-     * @param max_range:     max range [m] within which a cone is expected to be detected
-     * @param half_fov_rad:  half of the horizontal FOV [rad]
-     */
-    void updateLandmarkVisibility(const float max_range, const float half_fov_rad);
 
 
     inline float euclideanDistance(float x1, float x2, float y1, float y2) {

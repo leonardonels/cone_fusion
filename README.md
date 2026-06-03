@@ -1,39 +1,40 @@
 # cone_fusion
 
-EKF-SLAM a coni che fonde l'odometria di **FAST-LIMO/FAST-LIO** (usata come sorgente di
-moto *relativa*) con i **coni statici** della pista (usati come landmark) per ancorare il
-drift globale della LIDAR-inertial odometry.
+Cone-based EKF-SLAM that fuses **FAST-LIMO/FAST-LIO** odometry (used as a *relative*
+motion source) with the track's **static cones** (used as landmarks) to anchor the
+global drift of the LiDAR-inertial odometry.
 
-Output principale: una posa odometrica `/Odometry` nel frame `track` che, dal secondo giro
-in poi, è riallineata sulla mappa dei coni e quindi non deriva con FAST-LIMO.
+Main output: an odometric pose `/Odometry` in the `track` frame which, from the second lap
+onward, is realigned onto the cone map and therefore does not drift with FAST-LIMO.
 
 ---
 
-## 1. Interfaccia ROS
+## 1. ROS interface
 
 ### Subscribe
-| Topic | Tipo | Uso |
+| Topic | Type | Use |
 |---|---|---|
-| `/clusters` (`cones_topic`) | `visualization_msgs/Marker` | coni osservati dal LiDAR (cluster), in frame sensore |
-| `/fast_limo/state` (`input_odom_topic`) | `nav_msgs/Odometry` | posa + covarianza di FAST-LIMO |
-| `/planning/race_status` (`race_status_topic`) | `mmr_base/RaceStatus` | giro corrente (per la logica di "primo giro completato") |
+| `/clusters` (`cones_topic`) | `visualization_msgs/Marker` | cones observed by the LiDAR (clusters), in sensor frame |
+| `/fast_limo/state` (`input_odom_topic`) | `nav_msgs/Odometry` | FAST-LIMO pose + covariance |
+| `/planning/race_status` (`race_status_topic`) | `mmr_base/RaceStatus` | current lap (for the "first lap completed" logic) |
 
 ### Publish
-| Topic | Tipo | Uso |
+| Topic | Type | Use |
 |---|---|---|
-| `/Odometry` (`output_odom_topic`) | `nav_msgs/Odometry` | posa stimata dall'EKF (frame `track` → `imu_link`) + TF |
-| `/slam/cones_positions` (`mapped_cones_topic`) | `visualization_msgs/Marker` | mappa dei coni (viva durante il mapping, congelata dopo) |
+| `/Odometry` (`output_odom_topic`) | `nav_msgs/Odometry` | pose estimated by the EKF (frame `track` → `imu_link`) + TF |
+| `/slam/cones_positions` (`mapped_cones_topic`) | `visualization_msgs/Marker` | cone map (live during mapping, frozen afterwards) |
+| `/slam/input_cones_debug` (`input_cones_debug_topic`) | `visualization_msgs/Marker` | **debug** (optional): raw input cones projected into the map frame with the current EKF pose (red markers), for an input-vs-map comparison |
 
 ### Frame
-Tutto lo stato vive nel frame **`track`**, la cui origine coincide con la posa di partenza
-del veicolo. La posa è planare: `track → imu_link` con sola traslazione XY e rotazione yaw.
+All state lives in the **`track`** frame, whose origin coincides with the vehicle's starting
+pose. The pose is planar: `track → imu_link` with only XY translation and yaw rotation.
 
 ---
 
-## 2. Rappresentazione dello stato
+## 2. State representation
 
-Lo stato è quello classico dell'EKF-SLAM (Thrun, *Probabilistic Robotics*, cap. 10) con
-landmark a posizione (range/bearing):
+The state is the classic EKF-SLAM one (Thrun, *Probabilistic Robotics*, ch. 10) with
+position landmarks (range/bearing):
 
 $$
 \mathbf{x} = \begin{bmatrix} x \\ y \\ \theta \\ m_{1,x} \\ m_{1,y} \\ \vdots \\ m_{N,x} \\ m_{N,y}\end{bmatrix}
@@ -41,13 +42,12 @@ $$
 \mathbf{P} \in \mathbb{R}^{(2N+3)\times(2N+3)}
 $$
 
-- $(x,y,\theta)$ = posa 2D del veicolo nel frame `track`.
-- $(m_{j,x}, m_{j,y})$ = posizione assoluta del cono $j$.
-- $N$ = `N_CONES` = **400** (capacità a compile-time, `ekf_odom.hpp`). La dimensione delle
-  matrici è fissa a $2N+3 = 803$; il numero di coni effettivamente mappati è
-  `landmark_count` $\le N$.
+- $(x,y,\theta)$ = 2D vehicle pose in the `track` frame.
+- $(m_{j,x}, m_{j,y})$ = absolute position of cone $j$.
+- $N$ = `N_CONES` = **400** (compile-time capacity, `ekf_odom.hpp`). The matrix size is
+  fixed at $2N+3 = 803$; the number of actually mapped cones is `landmark_count` $\le N$.
 
-**Inizializzazione** (`EKFOdom` ctor):
+**Initialization** (`EKFOdom` ctor):
 
 $$
 \mathbf{x} = \mathbf{0}, \qquad
@@ -55,30 +55,29 @@ $$
 \quad \texttt{INF}=10
 $$
 
-I landmark partono con covarianza "infinita" e cross-covarianza nulla: sono **disaccoppiati**
-finché non vengono osservati. Questo è ciò che permette di lavorare solo sul sotto-blocco
-attivo (§5).
+Landmarks start with "infinite" covariance and zero cross-covariance: they are **decoupled**
+until observed. This is what allows working only on the active sub-block (§5).
 
 ---
 
-## 3. Passo di predizione (moto relativo da FAST-LIMO)
+## 3. Prediction step (relative motion from FAST-LIMO)
 
-> **Decisione di design.** FAST-LIMO **non** è trattato come verità assoluta della posa, ma
-> come **odometria relativa**. Lo stato EKF è ancorato all'origine `track`; ad ogni messaggio
-> si applica solo l'*incremento* di moto di FAST-LIMO. Così la correzione dei coni rimane
-> nello stato invece di essere sovrascritta dalla posa grezza ad ogni frame.
+> **Design decision.** FAST-LIMO is **not** treated as absolute pose ground truth, but as
+> **relative odometry**. The EKF state is anchored at the `track` origin; at each message only
+> the *increment* of FAST-LIMO motion is applied. This way the cone correction stays in the
+> state instead of being overwritten by the raw pose at every frame.
 
-`setPose(p_k)` con $p_k = (x_k^{L}, y_k^{L}, \theta_k^{L})$ posa di FAST-LIMO:
+`setPose(p_k)` with $p_k = (x_k^{L}, y_k^{L}, \theta_k^{L})$ the FAST-LIMO pose:
 
-**Primo frame** ($\texttt{is\_pose\_initialized}=\text{false}$): si registra solo il
-riferimento, lo stato resta all'origine.
+**First frame** ($\texttt{is\_pose\_initialized}=\text{false}$): only the reference is
+recorded, the state stays at the origin.
 
 $$
-p_{\text{prev}} \leftarrow p_k, \qquad \mathbf{x}_{0:3} \;\text{invariato} \;(=\mathbf{0})
+p_{\text{prev}} \leftarrow p_k, \qquad \mathbf{x}_{0:3} \;\text{unchanged} \;(=\mathbf{0})
 $$
 
-**Frame successivi:** si calcola lo spostamento relativo nel body-frame del frame precedente
-e lo si compone sulla posa EKF (composizione rigida $T_{\text{ekf}} \leftarrow
+**Subsequent frames:** the relative displacement is computed in the body-frame of the
+previous frame and composed onto the EKF pose (rigid composition $T_{\text{ekf}} \leftarrow
 T_{\text{ekf}}\cdot T_{\text{prev}}^{-1}\cdot T_k$):
 
 $$
@@ -98,76 +97,105 @@ y &\mathrel{+}= \sin\theta\,\ell_x + \cos\theta\,\ell_y \\
 \end{aligned}
 $$
 
-**Covarianza — propagazione** (in `setPose`): la posa-incremento è anche propagata attraverso
-il Jacobiano del moto $G$, esattamente come il passo *predict* di un EKF:
+**Covariance — propagation** (in `setPose`): the pose increment is also propagated through
+the motion Jacobian $G$, exactly like an EKF *predict* step:
 
 $$
 \mathbf{P} \leftarrow G\,\mathbf{P}\,G^\top, \qquad
-G = \begin{bmatrix} 1 & 0 & -d_{w,y} \\ 0 & 1 & \;\;d_{w,x} \\ 0 & 0 & 1\end{bmatrix} \;\text{(blocco posa; } I \text{ altrove)}
+G = \begin{bmatrix} 1 & 0 & -d_{w,y} \\ 0 & 1 & \;\;d_{w,x} \\ 0 & 0 & 1\end{bmatrix} \;\text{(pose block; } I \text{ elsewhere)}
 $$
 
-dove $(d_{w,x}, d_{w,y}) = R(\theta)\,(\ell_x,\ell_y)$ è lo spostamento in frame mondo. $G$
-accoppia l'incertezza di heading nella covarianza di posizione e **ruota le cross-covarianze
-posa–landmark**; senza, $\mathbf{P}$ crescerebbe solo sulla diagonale e le correzioni si
-distribuirebbero male tra $x,y,\theta$. Si opera solo sul sotto-blocco attivo (i landmark
-inattivi sono disaccoppiati), quindi il costo è $O(n_a)$.
+where $(d_{w,x}, d_{w,y}) = R(\theta)\,(\ell_x,\ell_y)$ is the world-frame displacement. $G$
+couples the heading uncertainty into the position covariance and **rotates the pose–landmark
+cross-covariances**; without it, $\mathbf{P}$ would grow only on its diagonal and corrections
+would distribute badly between $x,y,\theta$. Only the active sub-block is touched (inactive
+landmarks are decoupled), so the cost is $O(n_a)$.
 
-**Covarianza — rumore di processo** (`setPoseCovariance`): dopo la propagazione si somma
-$Q_{\text{motion}}$, cioè **solo l'incremento** di covarianza di FAST-LIMO (non il valore
-assoluto, che sommato ad ogni frame ad alto rate farebbe esplodere $\mathbf{P}$):
+**Covariance — additive, motion-based process noise** (`setPose`, `noises.motion_noise`):
+right after the $G\mathbf{P}G^\top$ propagation, **pose uncertainty is injected proportional to
+how far the vehicle moved** this step:
+
+$$
+P_{00} \mathrel{+}= q_{\text{pos}}\,\lVert(\ell_x,\ell_y)\rVert, \quad
+P_{11} \mathrel{+}= q_{\text{pos}}\,\lVert(\ell_x,\ell_y)\rVert, \quad
+P_{22} \mathrel{+}= q_{\text{yaw}}\,\lvert\Delta_\theta\rvert
+$$
+
+This is the $Q$ term of the *predict* step and it is the **critical** part: without it,
+$\mathbf{P}$ can only **shrink** (cone corrections reduce it, nothing makes it grow back) and
+collapses to $\sim 0$ after a few laps. With $\mathbf{P}$ collapsed the filter becomes
+**overconfident** in the FAST-LIMO-propagated pose: $S = H\mathbf{P}H^\top + Q$ becomes tiny
+and the **Mahalanobis gate** (§4.4) starts **rejecting the very cones** that would correct the
+accumulated drift → map divergence in the late laps. Scaling the noise with the
+travelled distance/rotation (rather than a constant per-scan term) mirrors how odometry error
+actually accumulates and is **zero when the vehicle is stopped**. Default `[0.05, 0.02]`;
+`[0, 0]` disables it (historical behavior).
+
+**Covariance — FAST-LIMO covariance increment** (`setPoseCovariance`): in addition, **only the
+increment** of the covariance reported by FAST-LIMO is added (not the absolute value, which
+summed at every high-rate frame would blow up $\mathbf{P}$):
 
 $$
 P_{ii} \mathrel{+}= \max\!\big(0,\; \sigma^{L}_{k,i} - \sigma^{L}_{k-1,i}\big), \quad i\in\{0,1,2\}
 $$
 
-Il clamp a $\ge 0$ evita che un eventuale calo della covarianza di FAST-LIMO (es. una sua
-relocalizzazione) restringa erroneamente $\mathbf{P}$: il restringimento deve venire **solo**
-dai coni, in `correct()`. Insieme, i due passi realizzano il classico
-$\mathbf{P}\leftarrow G\mathbf{P}G^\top + Q_{\text{motion}}$.
+The clamp to $\ge 0$ prevents an occasional drop in FAST-LIMO's covariance (e.g. its own
+relocalization) from improperly shrinking $\mathbf{P}$: the shrinking must come **only** from
+the cones, in `correct()`. Together, the three steps realize the classic
+$\mathbf{P}\leftarrow G\mathbf{P}G^\top + Q_{\text{motion}}$, where $Q_{\text{motion}}$ is the
+sum of the motion-based term (above, the primary and reliable source) and the FAST-LIMO
+increment.
 
-> **Nota.** Esiste anche un `predict(dt)` con modello cinematico a velocità/velocità angolare
-> ($v$, $\omega$), ma **non è collegato** nella pipeline attuale (`setActVel`/`setActAngVel`
-> non vengono mai chiamati). La predizione è interamente fatta dall'incremento relativo qui
-> sopra. Il metodo è lasciato per un eventuale uso futuro con un'IMU/encoder.
+> **Note.** There is also a `predict(dt)` with a velocity/angular-velocity kinematic model
+> ($v$, $\omega$), but it is **not wired** in the current pipeline (`setActVel`/`setActAngVel`
+> are never called). Prediction is done entirely by the relative increment above. The method
+> is left for possible future use with an IMU/encoder.
 
 ---
 
-## 4. Passo di correzione (coni)
+## 4. Correction step (cones)
 
-`correct(z, M)` riceve $M$ osservazioni $z_i = (\rho_i, \phi_i, c_i)$ = range, bearing,
-colore, calcolate in `conesCallback` dai punti del cluster:
+`correct(z, M)` receives $M$ observations $z_i = (\rho_i, \phi_i, c_i)$ = range, bearing,
+color, computed in `conesCallback` from the cluster points:
 
 $$
 \rho_i = \sqrt{p_x^2 + p_y^2}, \qquad \phi_i = \operatorname{wrap}\!\big(\operatorname{atan2}(p_y, p_x)\big)
 $$
 
-### 4.1 Associazione dati (nearest-neighbour)
+### 4.1 Data association (nearest-neighbour)
 
-Per ogni osservazione si proietta il cono nel frame globale data la posa corrente:
+For each observation the cone is projected into the global frame given the current pose:
 
 $$
 \hat{m}_i = \begin{bmatrix} x \\ y \end{bmatrix} + \rho_i \begin{bmatrix}\cos(\phi_i + \theta)\\ \sin(\phi_i + \theta)\end{bmatrix}
 $$
 
-e si cerca il landmark mappato più vicino in distanza euclidea, indice $k$, distanza
-$d_{\min}$.
+and the nearest mapped landmark in Euclidean distance is found, index $k$, distance
+$d_{\min}$. The association **decision**, however, depends on the lap:
 
-- Se $d_{\min} > \alpha$ (`min_new_cone_distance`):
-  - **solo durante il 1° giro** → nuovo landmark: $m_k \leftarrow \hat{m}_i$, `landmark_count++`.
-  - **dal 2° giro** → osservazione scartata (`continue`): la mappa non cresce più (ancora fissa).
-- Altrimenti → associazione al landmark $k$ (e aggiornamento del contatore colore).
+- **Lap 1 (mapping):** fixed Euclidean gate. If $d_{\min} > \alpha$ (`min_new_cone_distance`)
+  → new landmark ($m_k \leftarrow \hat{m}_i$, `landmark_count++`); otherwise → association to $k$.
+- **From lap 2 (localization):** **Mahalanobis** gate on the nearest candidate $k$. The
+  innovation $\nu$ and the **pose-only** innovation covariance $S = H_p P_{pp} H_p^\top + Q$
+  (§4.3) are computed, and the observation is accepted only if $d^2 = \nu^\top S^{-1}\nu \le$
+  `assoc_maha_gate`; otherwise it is discarded (fixed map, no new cones). This replaces the
+  fixed Euclidean radius: the capture region **adapts to the uncertainty** ($\propto S$)
+  instead of being a constant circle. This matters because, under heading drift, far cones get
+  displaced beyond a fixed radius and the Euclidean NN would discard them → the correction
+  stalls and the drift diverges; the Mahalanobis gate keeps them. It is the **only gating
+  point** for lap 2+ (the update steps do not re-gate).
 
-I coni **arancioni** ($c\in\{2,3\}$) sono scartati.
+**Orange** cones ($c\in\{2,3\}$) are discarded.
 
-### 4.2 Modello di misura e Jacobiano
+### 4.2 Measurement model and Jacobian
 
-Per il landmark associato $k$, con $\delta = m_k - (x,y)^\top$ e $q = \delta^\top\delta$:
+For the associated landmark $k$, with $\delta = m_k - (x,y)^\top$ and $q = \delta^\top\delta$:
 
 $$
 \hat{z} = h(\mathbf{x}) = \begin{bmatrix}\sqrt{q}\\ \operatorname{wrap}\big(\operatorname{atan2}(\delta_y,\delta_x) - \theta\big)\end{bmatrix}
 $$
 
-Jacobiano "basso" $2\times 5$ rispetto a $[x,y,\theta,m_{k,x},m_{k,y}]$:
+"Low" Jacobian $2\times 5$ with respect to $[x,y,\theta,m_{k,x},m_{k,y}]$:
 
 $$
 {}^{low}H = \frac{1}{q}\begin{bmatrix}
@@ -176,10 +204,10 @@ $$
 \end{bmatrix}
 $$
 
-mappato sullo stato tramite $F_{x,k}$ (seleziona le 3 colonne della posa e le 2 del landmark
+mapped onto the state via $F_{x,k}$ (selects the 3 pose columns and the 2 of landmark
 $k$): $H = {}^{low}H \, F_{x,k}$.
 
-### 4.3 Aggiornamento di Kalman
+### 4.3 Kalman update
 
 $$
 S = H\,\mathbf{P}\,H^\top + Q \;(2\times2), \qquad
@@ -188,167 +216,192 @@ K = \mathbf{P}\,H^\top S^{-1}, \qquad
 \mathbf{P} \leftarrow \mathbf{P} - K\,(H\mathbf{P})
 $$
 
-dove $Q$ = `proc_noise` (vedi §6, nomenclatura non standard). L'update di $\mathbf{P}$ è scritto
-come $\mathbf{P} - K(H\mathbf{P})$, algebricamente identico a $(I-KH)\mathbf{P}$ ma in $O(n_a^2)$
-invece di $O(n^3)$ (§5).
+where $Q$ = `proc_noise` (see §6, non-standard naming). The $\mathbf{P}$ update is written
+as $\mathbf{P} - K(H\mathbf{P})$, algebraically identical to $(I-KH)\mathbf{P}$ but in $O(n_a^2)$
+instead of $O(n^3)$ (§5).
 
-**Wrapping dell'innovazione.** La componente di bearing dell'innovazione $\nu = z - \hat z$
-viene normalizzata a $[-\pi,\pi]$: sia $\phi_i$ sia $\hat z_\theta$ sono già normalizzati
-singolarmente, ma la loro **differenza** può cadere a cavallo di $\pm\pi$ (es. $+3.0-(-3.0)=6.0$
-rad invece di $-0.28$). Senza il wrapping, un cono ri-osservato attraverso la discontinuità
-angolare — tipico alla chiusura del giro — inietterebbe un'innovazione enorme e spuria che fa
-"scattare" la posa.
+**Innovation wrapping.** The bearing component of the innovation $\nu = z - \hat z$ is
+normalized to $[-\pi,\pi]$: both $\phi_i$ and $\hat z_\theta$ are already normalized
+individually, but their **difference** can straddle $\pm\pi$ (e.g. $+3.0-(-3.0)=6.0$
+rad instead of $-0.28$). Without the wrapping, a cone re-observed across the angular
+discontinuity — typical at lap closure — would inject a huge, spurious innovation that
+"snaps" the pose.
 
-### 4.4 Gating di associazione (Mahalanobis)
+### 4.4 Mahalanobis gate (association, from lap 2)
 
-Prima di applicare l'update, l'innovazione è testata con la distanza di Mahalanobis normalizzata,
-che segue una chi-quadro a 2 gradi di libertà (range + bearing):
-
-$$
-d^2 = \nu^\top S^{-1} \nu, \qquad \nu = z - \hat z
-$$
-
-Se $d^2 > 9.21$ (bound al 99% per 2 DoF) l'osservazione è grossolanamente incoerente con il
-landmark associato — quasi sempre un'**associazione errata** (es. alla chiusura del giro, quando
-si ri-osservano i primi coni con il drift accumulato) — e l'update viene **scartato**
-(`continue`). Il gate è attivo **solo dal 2° giro** (`is_first_lap_completed`): durante il 1°
-giro la posa è comunque congelata ($K_{0:3}=0$) e la mappa si sta ancora formando, quindi tutte
-le associazioni vengono lasciate raffinare i landmark. Poiché il gate può solo **scartare**
-update, non restringe mai $\mathbf{P}$ in modo improprio.
-
-### 4.5 Reiezione dei falsi positivi (rapporto rilevazioni/visibilità)
-
-Un contatore cumulativo di "quante volte un cono è stato visto" non distingue **5 rilevazioni
-in un giro** (cono reale) da **5 rilevazioni sparse su 6 giri** (falso positivo): cresce in modo
-monotono e, su molti giri, anche i ghost finiscono per superare la soglia. Per questo ogni
-landmark mantiene **due** contatori (`color_logic.hpp`):
-
-- `detected` — incrementato ad ogni associazione (in `setColor`, §4.1);
-- `expected` — incrementato ad ogni scan in cui il landmark cade dentro il FOV/range del sensore.
-
-`expected` è aggiornato da `updateLandmarkVisibility(max_range, half_fov)`, chiamato una volta
-per scan in `conesCallback` dopo `correct()`: per ogni cono mappato si predice range/bearing
-dalla posa corrente e, se $\rho < \texttt{lidar\_max\_range}$ e $|\phi| < \texttt{lidar\_fov}/2$,
-si fa `expected++`.
-
-Un cono è pubblicato solo se supera **entrambe** le soglie:
+From lap 2, accepting an association goes through the normalized Mahalanobis distance,
+which follows a chi-square with 2 degrees of freedom (range + bearing):
 
 $$
-\texttt{detected} \ge \texttt{cone\_time\_seen\_th}
-\quad\wedge\quad
-\frac{\texttt{detected}}{\texttt{expected}} \ge \texttt{cone\_confidence\_th}
+d^2 = \nu^\top S^{-1} \nu, \qquad \nu = z - \hat z, \qquad S = H_p P_{pp} H_p^\top + Q
 $$
 
-Il rapporto $\approx 1$ per un cono reale (rilevato quasi ad ogni passaggio in cui è visibile)
-e resta basso per un ghost che combacia solo sporadicamente — es. visto 5 volte ma in FOV 50+
-volte su 6 giri $\Rightarrow 0.1$, scartato. Con `cones_pub_for_debug: true` il gate è
-rivalutato ad ogni scan su tutti i giri, quindi il rapporto si stringe man mano che si accumula
-evidenza.
+If $d^2 >$ `assoc_maha_gate` (default `9.21`, 99% bound for 2 DoF) the observation is
+inconsistent with the nearest landmark and is **discarded** (`continue`) — be it a **wrong
+association** (e.g. at lap closure) or a cone that is too far. The gate is evaluated at
+**association** time (§4.1) and is the only gating point for lap 2+: the update steps (single
+cone and batch) do not re-do it. During lap 1 it does not apply (the pose is frozen,
+$K_{0:3}=0$, and the map is still forming; the Euclidean gate `min_new_cone_distance` holds).
+Since it can only **discard** observations, it never improperly shrinks $\mathbf{P}$.
+
+### 4.5 Update mode: single cone vs batch (`batch_cone_update`)
+
+By default the Kalman update (§4.3) is applied **only to the last cone** of the message
+(`i == M-1`): cheap (one $O(n_a^2)$ update per scan) and stable, but it uses a single
+measurement out of $M$ and depends on detection order. With `generic.batch_cone_update: true`
+a **batch (joint)** path is enabled: during the loop **all** associations are collected and,
+after the loop, **a single** joint update is applied.
+
+$$
+H = \begin{bmatrix} H_1 \\ \vdots \\ H_m \end{bmatrix}_{(2m\times n_a)}, \quad
+\nu = \begin{bmatrix}\nu_1 \\ \vdots \\ \nu_m\end{bmatrix}, \quad
+R = \operatorname{blkdiag}(Q,\dots,Q)_{(2m\times 2m)}
+$$
+$$
+S = H\mathbf{P}H^\top + R, \qquad K = \mathbf{P}H^\top S^{-1}, \qquad
+\mathbf{x}\mathrel{+}=K\nu, \qquad \mathbf{P}\leftarrow\mathbf{P}-K(H\mathbf{P})
+$$
+
+The cones in `batch_obs` have already been validated by the Mahalanobis gate at association
+time (§4.4), and during lap 1 $K_{0:3}=0$ still holds. Key point: the fusion is **joint**, not
+sequential. Applying $M$ separate updates per scan would shrink $\mathbf{P}$ by ~$M$ times,
+making the filter overconfident until it diverges (observed in practice: the map blows up);
+the joint update linearizes all cones at the **same** state and does **a single** covariance
+reduction, using all the information while staying consistent. Cost: $S$ is $2m\times2m$ →
+$O((2m)^3)$ for the inversion, negligible for $m\sim20$; the products stay $O(m\,n_a^2)$.
 
 ---
 
-## 5. Decisioni di design e ottimizzazioni
+## 5. Design decisions and optimizations
 
-### Ancora attiva solo dal 2° giro
-La forza dell'ancora dipende da una mappa matura. Per evitare correzioni rumorose all'avvio
-(mappa sparsa, geometria povera, associazioni incerte), durante il **1° giro** la correzione
-**non muove la posa**: si azzerano le righe-posa del guadagno,
+### Two regimes: mapping (lap 1) → localization on a rigid map (from lap 2)
+The anchor's strength depends on a mature map, and `correct()` uses **two different
+formulations** of the update depending on the lap:
 
-$$K_{0:3} \leftarrow 0 \quad \text{se } \neg\,\texttt{is\_first\_lap\_completed}$$
+- **Lap 1** (`¬ is_first_lap_completed`): **full-state** EKF-SLAM update on the active
+  sub-block (pose + landmarks), but with the **pose rows of the gain zeroed** ($K_{0:3}=0$).
+  This way the cones **build and refine the map** while the pose follows FAST-LIMO in pure
+  relative mode (pose corrections from a sparse map would be noisy).
+- **From lap 2** (`current_lap > 1`): **pose-only** update (localization on a known map). The
+  landmark is treated as a **constant** and only the $3\times3$ pose block is updated:
+  $$
+  H_p \in \mathbb{R}^{2\times3}, \quad S = H_p P_{pp} H_p^\top + Q, \quad
+  K_p = P_{pp} H_p^\top S^{-1}, \quad x_{0:3}\mathrel{+}=K_p\nu, \quad P_{pp}\leftarrow P_{pp}-K_p H_p P_{pp}
+  $$
+  This is preferable to zeroing the landmark rows of a full-state gain after the fact: that
+  truncation makes $K \neq P H^\top S^{-1}$ and **breaks the consistency/symmetry of
+  $\mathbf{P}$** (pose drift and snap over multiple laps). The pose-only update keeps
+  $\mathbf{P}$ consistent **and** fixes the **gauge** degree of freedom: the global orientation
+  of a SLAM map is observable only from the initial anchor, so continuing to update the
+  landmarks too would let small biases **slowly rotate** the whole map after a few laps. From
+  lap 2 no more cones are added.
 
-così il 1° giro **costruisce e raffina la mappa** mentre la posa segue FAST-LIMO in puro
-relativo. `is_first_lap_completed` diventa `true` quando `current_lap > 1`. Dal 2° giro il
-guadagno è pieno → la posa viene ancorata, e non si aggiungono più coni.
+### Soft lap-1 → lap-2 handoff (`anchor_ramp_scans`)
+During lap 1 the pose accumulates the **FAST-LIMO drift** and $P_{pp}$ **grows** (no
+correction shrinks it). At the instant of transition to lap 2 the cones start correcting the
+pose with a large gain → the accumulated drift is corrected **in a single step** (a visible
+*snap*). With `generic.anchor_ramp_scans > 0` the pose correction is scaled by a factor
+$\alpha = \min(1, n/N)$ that grows from ~0 to 1 over the first $N$ correction scans of lap 2,
+spreading the realignment over several steps instead of just one. $0$ = instant snap
+(historical behavior).
 
-### Sotto-blocco attivo + update $O(n_a^2)$
-Le matrici sono dimensionate a $n=803$ ma i landmark non mappati sono `INF·I` disaccoppiati:
-le loro righe di $K$ sono comunque nulle. Tutte le operazioni di `correct()` girano quindi
-sul solo blocco attivo $n_a = 3 + 2\cdot\texttt{landmark\_count}$. Inoltre l'update della
-covarianza usa la forma $\mathbf{P}-K(H\mathbf{P})$ ($O(n_a^2)$) invece del prodotto pieno
-$(I-KH)\mathbf{P}$ ($O(n^3)$). Questo è essenziale su Jetson Orin (IPC CPU modesto), e scala
-bene se si aumenta `N_CONES`.
+### Active sub-block + $O(n_a^2)$ update
+The matrices are sized at $n=803$ but the unmapped landmarks are `INF·I` decoupled:
+their rows in $K$ are zero anyway. All of `correct()`'s operations therefore run on the
+active block only, $n_a = 3 + 2\cdot\texttt{landmark\_count}$. Moreover the covariance
+update uses the form $\mathbf{P}-K(H\mathbf{P})$ ($O(n_a^2)$) instead of the full product
+$(I-KH)\mathbf{P}$ ($O(n^3)$). This is essential on a Jetson Orin (modest CPU IPC), and scales
+well if `N_CONES` is increased.
 
-### Una sola sorgente di pubblicazione
-- `/Odometry` è pubblicata **solo** da `fastLimoDataCallback` (rate FAST-LIMO, alto), leggendo
-  lo stato EKF `getState().head(3)` — **non** la posa LIMO grezza.
-- I marker dei coni sono pubblicati **solo** da `conesCallback`, per evitare che due set diversi
-  (mappa viva vs congelata) finiscano sullo stesso topic facendo "vibrare" i coni in RViz.
+### A single publication source
+- `/Odometry` is published **only** by `fastLimoDataCallback` (FAST-LIMO rate, high), reading
+  the EKF state `getState().head(3)` — **not** the raw LIMO pose.
+- The cone markers are published **only** by `conesCallback`, to avoid two different sets
+  (live map vs frozen) ending up on the same topic and making the cones "jitter" in RViz.
 
 ---
 
-## 6. Tuning dei parametri (`config/config.yaml`)
+## 6. Parameter tuning (`config/config.yaml`)
 
-> ⚠️ **Nomenclatura non standard.** Nel codice i due rumori sono mappati al contrario rispetto
-> alla convenzione EKF, e sono usati come **varianza** (il quadrato è commentato, quindi il
-> valore inserito è $\sigma^2$, non $\sigma$, nonostante i commenti dicano "Sigma"):
-> - `noises.proc_noise` → matrice $Q$ (2×2), **covarianza di innovazione della misura** in `correct()`.
-> - `noises.meas_noise` → matrice $R$ (3×3), rumore di processo di `predict()` → **attualmente inerte** (predict non è chiamato).
+> ⚠️ **Non-standard naming.** In the code the two noises are mapped the opposite way compared
+> to the EKF convention, and they are used as **variance** (the square is commented out, so the
+> entered value is $\sigma^2$, not $\sigma$, despite the comments saying "Sigma"):
+> - `noises.proc_noise` → matrix $Q$ (2×2), **measurement innovation covariance** in `correct()`.
+> - `noises.meas_noise` → matrix $R$ (3×3), process noise of `predict()` → **currently inert** (predict is not called).
 
-| Parametro | Effetto | Come tararlo |
+| Parameter | Effect | How to tune |
 |---|---|---|
-| `noises.proc_noise` `[var_range, var_bearing]` | Quanto il filtro si fida dei coni. È la $Q$ in $S=HPH^\top+Q$. **Grande** → coni meno credibili → correzioni dolci, ancoraggio lento, meno jitter. **Piccolo** → correzioni aggressive, ancoraggio rapido, più jitter e rischio di divergenza con associazioni errate. | Parti da `[0.1, 0.1]`. Se i coni "vibrano"/la posa scatta dal 2° giro, **aumenta**. Se l'ancora è troppo lenta a recuperare il drift, **diminuisci**. `var_bearing` in rad²: 0.1 ≈ σ≈18°, piuttosto largo. |
-| `noises.meas_noise` `[x,y,yaw]` | $R$ di `predict()`. **Inerte** finché `predict()` non viene collegato. | Lasciare com'è; rilevante solo se si attiva il modello a velocità. |
-| `noises.min_new_cone_distance` ($\alpha$) [m] | Soglia di associazione / creazione nuovo cono. **Grande** → meno coni nuovi, associazione più aggressiva (rischio di fondere coni distinti). **Piccolo** → più coni (rischio duplicati da rumore). | Impostare **sotto la metà** della spaziatura minima tra coni adiacenti in pista e **sopra** il rumore di posizione per-frame. Default `2.0`. |
-| `generic.cone_time_seen_th` | Soglia **assoluta minima** di rilevazioni perché un cono sia eleggibile alla pubblicazione (combinata con il rapporto `cone_confidence_th`, §4.5). **Alto** → mappa più pulita ma coni che compaiono tardi. | `4` è un buon compromesso; alza se vedi coni spuri, abbassa se la mappa si popola troppo lentamente. |
-| `generic.lidar_max_range` [m] | Range entro cui un cono è considerato "atteso" (`expected++`) nel rapporto di confidenza (§4.5). **Troppo grande** → coni reali oltre la portata reale del percettore accumulano `expected` senza `detected` e vengono scartati per errore. | Impostare al range entro cui il **percettore** rileva i coni in modo affidabile, **non** al range massimo grezzo del LiDAR. |
-| `generic.lidar_fov` [deg] | FOV orizzontale (angolo pieno) usato per il test di visibilità (§4.5). | Impostare al FOV effettivo del percettore di coni. |
-| `generic.cone_confidence_th` `[0..1]` | Soglia minima del rapporto `detected/expected` per pubblicare un cono (reiezione FP, §4.5). **Alto** → mappa più pulita ma rischio di scartare coni reali ai bordi; **basso** → più permissivo. | Parti da `0.3`; alza verso `0.5–0.6` se i ghost passano ancora. Se vengono scartati coni reali ai bordi, **prima** restringi `lidar_max_range`/`lidar_fov`. |
-| `generic.cones_pub_for_debug` | `true` → pubblica la mappa **viva** dell'EKF anche dopo il 1° giro (debug). `false` → pubblica la mappa **congelata**. | Tieni `false` in gara. In debug ricorda che la viva si muove (i coni associati sono ancora corretti dal filtro). |
-| `generic.is_colorblind` | `true` → tutti i coni trattati come gialli (colore ignorato nell'associazione). | Lasciare `true` se il colore dal percettore non è affidabile. |
-| `generic.is_skidpad_mission` | Modalità skidpad: pubblica solo posa, niente marker coni. | `false` per missioni con mappatura coni. |
-| `N_CONES` (compile-time, `ekf_odom.hpp`) | Capacità massima di landmark. Aumentarlo ingrandisce le matrici (costo $\propto N$ sul blocco inattivo, ma `correct()` lavora solo su $n_a$). | Alzare se la pista ha più di ~400 coni. |
+| `noises.proc_noise` `[var_range, var_bearing]` | How much the filter trusts the cones. It is the $Q$ in $S=HPH^\top+Q$. **Large** → cones less credible → soft corrections, slow anchoring, less jitter. **Small** → aggressive corrections, fast anchoring, more jitter and risk of divergence under wrong associations. | Start at `[0.1, 0.1]`. If the cones "jitter"/the pose snaps from lap 2, **increase**. If the anchor is too slow to recover the drift, **decrease**. `var_bearing` in rad²: 0.1 ≈ σ≈18°, fairly wide. |
+| `noises.motion_noise` `[q_pos, q_yaw]` | Additive, motion-based process noise (§3): $P_{xx},P_{yy} \mathrel{+}= q_{\text{pos}}\cdot\lVert\Delta\rVert$, $P_{\theta\theta}\mathrel{+}= q_{\text{yaw}}\cdot\lvert\Delta_\theta\rvert$ each step. It is the $Q$ of the *predict* step and prevents $\mathbf{P}$ from **collapsing** lap after lap (which would make the filter overconfident and have the Mahalanobis gate reject good cones → late divergence). **Large** → $\mathbf{P}$ stays higher → pose more reactive to the cones but more jitter. **Small/0** → $\mathbf{P}$ collapses, gate too selective, drift in the late laps. | Start at `[0.05, 0.02]` (`q_pos` in m²/m, `q_yaw` in rad²/rad). In the diagnostic log `Pyy` should settle to a **small but non-zero** value (~0.01–0.05) instead of decaying toward ~0.0008, and `corrected` should track `detected` even in laps 7–8. If drift persists, **raise**; if the pose gets jittery, **lower**. Note: `setPose` runs at the FAST-LIMO rate (~100 Hz), so the term accumulates over many steps between cone scans. |
+| `noises.meas_noise` `[x,y,yaw]` | $R$ of `predict()`. **Inert** until `predict()` is wired. | Leave as is; relevant only if the velocity model is enabled. |
+| `noises.min_new_cone_distance` ($\alpha$) [m] | Euclidean threshold to create a new cone **only in lap 1** (§4.1). **Large** → fewer new cones (risk of merging distinct cones). **Small** → more cones (risk of duplicates from noise). From lap 2 association uses `assoc_maha_gate` instead. | Set it **below half** the minimum spacing between adjacent cones on track and **above** the per-frame position noise. |
+| `generic.assoc_maha_gate` | Chi-square gate (2 DoF) for the Mahalanobis association from lap 2 (§4.1/§4.4): accept if $d^2=\nu^\top S^{-1}\nu \le$ gate. Replaces the fixed Euclidean radius with an **uncertainty-adaptive** capture region. **High** → keeps correcting under larger drift (but more risk of wrong associations); **low** → more aggressive rejection. | `5.99`=95%, `9.21`=99%, `13.8`=99.9%. If the pose "slides" and the red (debug) cones stop landing on the map on far stretches, **raise** the gate; if jumps from wrong associations appear, **lower** it. |
+| `generic.cone_time_seen_th` | How many times a cone must be observed before entering the published/frozen map. **High** → cleaner map but cones that appear late. | `4` is a good compromise; raise if you see spurious cones, lower if the map populates too slowly. |
+| `generic.cones_pub_for_debug` | `true` → publishes the EKF's **live** map even after lap 1 (debug). `false` → publishes the **frozen** map. | Keep `false` in a race. In debug, remember the live one moves (the associated cones are still corrected by the filter). |
+| `generic.pub_input_cones_debug` | `true` → publishes on `input_cones_debug_topic` the raw input cones projected into the map frame with the current EKF pose (**red** markers). | Debug tool: the red ones should land on the mapped cones; if they "slide away" the pose is drifting. Keep `false` in a race. |
+| `generic.batch_cone_update` | Correction mode (§4.5). `false` → update on the last cone/scan only (default, cheap, stable). `true` → **joint** update over all associated cones (more information, less "nervous" pose). | Leave `false` as baseline; set `true` for the A/B test. If the pose becomes unstable in batch, raise `noises.proc_noise` (the $Q$ in $S$): the joint update is more aggressive because it fuses more measurements. |
+| `generic.anchor_ramp_scans` | Soft lap-1 → lap-2 handoff (§5). $N$ correction scans over which the pose is gradually realigned at the transition to lap 2. `0` → instant snap. **High** → smoother transition but slower realignment. | If you see a pose *kink* exactly at the lap change, set it to ~`30–80` (≈ a few seconds at the cone rate) and adjust. Not needed if lap-1 drift is small. |
+| `generic.is_colorblind` | `true` → all cones treated as yellow (color ignored in association). | Leave `true` if the color from the perceptor is unreliable. |
+| `generic.is_skidpad_mission` | Skidpad mode: publishes pose only, no cone markers. | `false` for missions with cone mapping. |
+| `N_CONES` (compile-time, `ekf_odom.hpp`) | Maximum landmark capacity. Increasing it enlarges the matrices (cost $\propto N$ on the inactive block, but `correct()` only works on $n_a$). | Raise if the track has more than ~400 cones. |
 
 ---
 
-## 7. Assunzioni
+## 7. Assumptions
 
-1. **Moto planare**: si stimano solo $(x,y,\theta)$; $z$, roll, pitch sono ignorati. Lo yaw è
-   estratto dal quaternione di FAST-LIMO.
-2. **FAST-LIMO localmente accurato**: la deriva è piccola sul breve periodo (un giro) e si
-   accumula sul lungo periodo → i coni la ancorano dal 2° giro.
-3. **Mondo statico**: i coni non si muovono; sono un riferimento globale fisso.
-4. **Partenza all'origine**: il veicolo parte nell'origine di `track` ($\mathbf{x}=\mathbf{0}$);
-   di FAST-LIMO si usa **solo il moto relativo**, quindi il suo frame assoluto è irrilevante.
-5. **Osservazioni in range/bearing** da cluster LiDAR, riferite all'origine del veicolo (nessun
-   offset estrinseco sensore→veicolo applicato).
-6. **Una sola correzione di misura per frame coni**: attualmente l'update di Kalman viene
-   eseguito solo sull'**ultimo** cono della lista (`i == M-1`); gli altri sono solo
-   associati/mappati. Vedi §8.
-7. **Coni arancioni scartati** nell'aggiornamento.
-
----
-
-## 8. Limitazioni note / TODO
-
-- **Update a singolo cono per frame** (`i == M-1`): sotto-vincola la posa (una misura range/
-  bearing fissa ~2 DoF su 3), dipende dall'ordine di detection e rende le correzioni "nervose".
-  Fondere tutte le associazioni del frame (update sequenziale o batch) ridurrebbe la varianza
-  di ~$1/M$. Con l'update già in $O(n_a^2)$ il costo è sostenibile anche su Orin.
-- **Coni non congelati dal 2° giro**: le righe-landmark di $K$ restano non nulle, quindi i coni
-  associati sono ancora leggermente mossi. Per un'ancora *rigida* si possono azzerare anche
-  quelle righe quando `is_first_lap_completed` (simmetrico al gating del 1° giro sulla posa).
-- **`predict()` scollegato**: il modello a velocità è codice dormiente.
-- **Membro `Fx_k` morto**: sostituito da `Fx_k_a` locale in `correct()`; rimuovibile.
-- **Nomenclatura rumori invertita** e usata come varianza: vedi §6.
+1. **Planar motion**: only $(x,y,\theta)$ are estimated; $z$, roll, pitch are ignored. Yaw is
+   extracted from the FAST-LIMO quaternion.
+2. **Locally accurate FAST-LIMO**: drift is small over the short term (one lap) and
+   accumulates over the long term → the cones anchor it from lap 2.
+3. **Static world**: cones do not move; they are a fixed global reference.
+4. **Start at the origin**: the vehicle starts at the `track` origin ($\mathbf{x}=\mathbf{0}$);
+   from FAST-LIMO **only the relative motion** is used, so its absolute frame is irrelevant.
+5. **Range/bearing observations** from LiDAR clusters, referred to the vehicle origin (no
+   sensor→vehicle extrinsic offset applied).
+6. **A single measurement correction per cone frame**: currently the Kalman update is
+   performed only on the **last** cone of the list (`i == M-1`); the others are only
+   associated/mapped. See §8.
+7. **Orange cones discarded** in the update.
 
 ---
 
-## 9. Flusso dati (riassunto)
+## 8. Known limitations / TODO
+
+- **Single-cone update per frame** (`i == M-1`, default): under-constrains the pose (a single
+  fixed range/bearing measurement, ~2 DoF out of 3), depends on detection order and makes the
+  corrections "nervous". An alternative **batch (joint)** path is available behind the flag
+  `generic.batch_cone_update` (§4.5) which fuses all of the frame's associations in a single
+  update, reducing variance by ~$1/M$. ⚠️ A naive *sequential* update (M separate updates per
+  scan) **diverges** — it shrinks $\mathbf{P}$ by ~$M$ times per scan, making the filter
+  overconfident: that's why the fusion is done in **joint** form (a single covariance
+  reduction), not sequentially.
+- **Single-lap map**: with the rigid anchor from lap 2 (§5) the map is the one built in lap 1
+  **only** and is no longer refined. It's a deliberate trade-off (it fixes the gauge and
+  eliminates the slow map rotation), but any lap-1 mapping errors remain: if lap 1 is noisy,
+  it's better to improve detection/association upstream than to reopen the landmark corrections
+  (which would reintroduce the rotational drift).
+- **`predict()` disconnected**: the velocity model is dormant code.
+- **Dead member `Fx_k`**: replaced by the local `Fx_k_a` in `correct()`; removable.
+- **Inverted noise naming** and used as variance: see §6.
+
+---
+
+## 9. Data flow (summary)
 
 ```
 /fast_limo/state ──▶ fastLimoDataCallback
-                      ├─ setPose()            : x ⊕= incremento relativo LIMO   (predict)
+                      ├─ setPose()            : x ⊕= relative LIMO increment   (predict)
+                      │                          P[pose] ← G P Gᵀ + Q_motion(|Δ|)  (process noise)
                       ├─ setPoseCovariance()  : P[pose] += ΔcovLIMO  (clamp ≥0)
-                      └─ updatePose()         : pubblica /Odometry da getState() (alto rate)
+                      └─ updatePose()         : publishes /Odometry from getState() (high rate)
 
 /clusters ──────────▶ conesCallback
-                      ├─ correct()                 : associazione NN + wrapping innovazione +
-                      │                               gate Mahalanobis + update Kalman (blocco attivo)
-                      │                               (1° giro: K[pose]=0 → solo mapping;
-                      │                                2° giro: K pieno → ancora la posa, no nuovi coni)
-                      ├─ updateLandmarkVisibility() : expected++ per i coni mappati dentro FOV/range
-                      └─ pubConesMarkers()         : pubblica i coni con detected ≥ cone_time_seen_th
-                                                      e detected/expected ≥ cone_confidence_th
+                      ├─ correct()                 : NN association + innovation wrapping +
+                      │                               Mahalanobis gate + Kalman update (active block)
+                      │                               (lap 1: K[pose]=0 → mapping only;
+                      │                                lap 2: full K → anchors the pose, no new cones)
+                      └─ pubConesMarkers()         : publishes cones seen ≥ cone_time_seen_th times
+                                                      (live map in debug/lap 1, or frozen)
 
 /planning/race_status ─▶ raceStatusCallback   : current_lap → setFirstLapCompleted(lap>1)
 ```

@@ -2,6 +2,8 @@
 
 #include <omp.h>
 #include <chrono>
+#include <vector>
+#include <utility>
 
 /* Constructor */
 EKFOdom::EKFOdom(Vector2f process_noise, Vector3f measurement_noise, const float alpha)
@@ -93,7 +95,9 @@ void EKFOdom::predict(const float dt) {
 
 
 /* EKF Correct step function */
-void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {    
+size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
+    /* Diagnostic: # of observations that passed data association this scan. */
+    size_t associated = 0;
     /* Vector that stores the temp parameters for a hypothetical new cone */
     Vector2f tmp_cone;
     /* Vector that stores the delta X,Y between a cone and the vehicle */
@@ -101,6 +105,23 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
 
     size_t i,k, j = 0;
     float min_dist;
+
+    /* Associations collected this scan for the batch (joint) update path:
+       (landmark index k, observed (range, bearing)). Unused in single-cone mode. */
+    std::vector<std::pair<size_t, Vector2f>> batch_obs;
+
+    /* Anchor ramp: over the first `anchor_ramp_scans_` correction scans of lap 2+,
+       scale the pose correction from ~0 up to 1, so the drift accumulated while
+       riding FAST-LIMO during lap 1 is realigned smoothly instead of snapping in
+       one step at the lap-1 -> lap-2 trust handoff. Stays 1.0 (no ramp) once
+       warmed up, or if disabled (anchor_ramp_scans_ == 0). */
+    float anchor_gain = 1.0f;
+    if (this->is_first_lap_completed && this->anchor_ramp_scans_ > 0)
+    {
+        this->anchor_scans_++;
+        const float a = (float)this->anchor_scans_ / (float)this->anchor_ramp_scans_;
+        anchor_gain = (a < 1.0f) ? a : 1.0f;
+    }
 
     // VectorXf new_state_update = VectorXf::Zero(2*N_CONES+3);
     // MatrixXf new_covariance_update = MatrixXf::Zero(2*N_CONES+3, 2*N_CONES+3);
@@ -139,42 +160,73 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
             }
         }
 
-        if(this->max_new_cone_dist < min_dist)
+        if (this->is_first_lap_completed)
         {
-            /* If this is not the first lap, skip to next observation */
-            if (this->is_first_lap_completed)
+            /* LAP 2+: associate by MAHALANOBIS distance (adaptive to the pose
+               uncertainty via S), not by a fixed Euclidean radius. A fixed metric
+               radius drops far cones once heading drift displaces them past it,
+               which stalls the correction and lets the drift run away; the
+               Mahalanobis gate scales with uncertainty so those cones keep
+               correcting. The map is frozen here, so a cone that fails the gate is
+               simply discarded (no new landmarks after lap 1). This is the single
+               gating point for lap 2+ — the update steps below no longer re-gate. */
+            Vector2f dlt = this->x_.segment(3 + 2*k, 2) - Vector2f(this->x_(0), this->x_(1));
+            float qd = dlt.transpose() * dlt;
+            qd = (qd == 0.0f) ? __FLT_MIN__ : qd;
+            const float sqd = sqrt(qd);
+
+            Vector2f expz(sqd, normalizeAngle(atan2(dlt(1), dlt(0)) - this->x_(2)));
+            Vector2f nu = Vector2f(z[i](0), z[i](1)) - expz;
+            nu(1) = normalizeAngle(nu(1));
+
+            /* Pose-only innovation covariance S = H_p P_pp H_p^T + Q (2x2). */
+            Matrix<float,2,3> Hp;
+            Hp << -sqd*dlt(0), -sqd*dlt(1),  0.0f,
+                      dlt(1),     -dlt(0),    -qd;
+            Hp /= qd;
+            Matrix3f P_pp = this->P_.topLeftCorner(3,3);
+            Matrix2f S = (Hp * P_pp * Hp.transpose()) + this->Q_;
+
+            const float d2 = nu.transpose() * S.inverse() * nu;
+            if (d2 > this->assoc_maha_gate_)
             {
-                continue;
+                continue;   /* not consistent with the nearest landmark -> drop */
             }
-
-            /* Discard orange cones */
-            if ((z[i][2] == 2) || (z[i][2] == 3))
-            {
-                // std::cerr << "Skipping orange cone.\n";
-                continue;   
-            }
-            /* New cone */
-            // is_new_cone = true;
-
-            // std::cerr << "EKF INDEX: " << i << " NEW CONE!!\n";
-            k = this->landmark_count;
-
-            this->landmark_count++;
-
-            /* Set initial landmark position and signature */
-            this->x_.segment(3 + (2*k), 2) = tmp_cone;
-            ColorLogic c;
-            c.setColor(static_cast<uint32_t>(z[i][2]));
-            this->s_(k) = c;
-        } else {
-            /* Otherwise, update color counter */
             this->s_(k).setColor(static_cast<uint32_t>(z[i][2]));
+        }
+        else
+        {
+            /* LAP 1: build the map with Euclidean nearest-neighbour + a fixed
+               radius (the map/pose covariance is still immature, so a metric gate
+               is simpler and robust for the new-vs-existing decision). */
+            if (this->max_new_cone_dist < min_dist)
+            {
+                /* New cone */
+                k = this->landmark_count;
+                this->landmark_count++;
+                this->x_.segment(3 + (2*k), 2) = tmp_cone;
+                ColorLogic c;
+                c.setColor(static_cast<uint32_t>(z[i][2]));
+                this->s_(k) = c;
+            }
+            else
+            {
+                /* Existing cone: update color counter */
+                this->s_(k).setColor(static_cast<uint32_t>(z[i][2]));
+            }
         }
 
         // std::cerr << "EKF INDEX: " << i << " k is: " << k << "\n";
-        if (i == (act_cones_detected-1))
+        associated++;   /* reached only by observations that passed association */
+        if (this->batch_update_)
         {
-            delta_k = this->x_.segment((3 + (2*k)), 2) - Vector2f(this->x_(0), this->x_(1)); /* This is equivalent to ((cone_x - vehicle_x), (cone_y - vehicle_y)) */            
+            /* Defer: collect this association. The joint update over all cones
+               is applied once after the loop (see batch block below). */
+            batch_obs.emplace_back(k, Vector2f(z[i](0), z[i](1)));
+        }
+        else if (i == (act_cones_detected-1))
+        {
+            delta_k = this->x_.segment((3 + (2*k)), 2) - Vector2f(this->x_(0), this->x_(1)); /* This is equivalent to ((cone_x - vehicle_x), (cone_y - vehicle_y)) */
 
             float q_k = delta_k.transpose() * delta_k; /* Compute euclidean distance ^2 */
 
@@ -196,19 +248,8 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                 // std::cerr << "EKF INDEX: " << i << " EXPC z is: \n" << exp_z_k << "\n";
             // }
 
-            /* Work only on the active sub-block of the state: pose (3) + mapped
-               landmarks (2*landmark_count). Inactive landmarks are decoupled
-               (P = INF*I, zero cross-covariance), so they are neither correlated
-               nor corrected here — including them in the matrix products is
-               wasted compute. */
-            const size_t na = 3 + 2 * this->landmark_count;
-
-            /* Fx_k maps the 5-dim [pose, landmark_k] block onto the active
-               state, sized (5, na). */
-            MatrixXf Fx_k_a = MatrixXf::Zero(5, na);
-            Fx_k_a.block(0,0,3,3) = Matrix3f::Identity();
-            Fx_k_a.block(3, 3 + 2*k, 2, 2) = Matrix2f::Identity();
-
+            /* Low-Jacobian block (2x5) over [pose | landmark k], pre-scaled by
+               1/q, and the (wrapped) measurement innovation. */
             MatrixXf ht_k = MatrixXf::Zero(2,5);
             ht_k(0,0) = -sqrt(q_k) * delta_k(0);
             ht_k(0,1) = -sqrt(q_k) * delta_k(1);
@@ -221,86 +262,172 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
             ht_k(1,2) = -q_k;
             ht_k(1,3) = -delta_k(1);
             ht_k(1,4) = delta_k(0);
-
-            /* Ht_k size: (2, na) */
-            MatrixXf Ht_k = ((1 / q_k) * ht_k) * Fx_k_a;
-
-            /* Active covariance block (na x na). */
-            auto P_a = this->P_.topLeftCorner(na, na);
-
-            /* Innovation covariance S (2x2) and Kalman gain K (na x 2). */
-            MatrixXf HtP = Ht_k * P_a;                          /* (2 x na) */
-            Matrix2f S = (HtP * Ht_k.transpose()) + this->Q_;
-            Matrix2f S_inv = S.inverse();
-            MatrixXf K = P_a * Ht_k.transpose() * S_inv;        /* (na x 2) */
+            ht_k /= q_k;
 
             Vector2f meas_diff = Vector2f(z[i](0), z[i](1)) - exp_z_k;
-            /* Wrap the bearing innovation to [-pi, pi]. Both terms are
-               individually normalized, but their difference can straddle the
-               +/-pi boundary (e.g. +3.0 - (-3.0) = 6.0 rad instead of -0.28).
-               Without this, a cone re-observed across the wrap (typical at loop
-               closure) injects a huge spurious innovation that snaps the pose. */
+            /* Wrap the bearing innovation to [-pi, pi]: both terms are normalized
+               individually but their difference can straddle +/-pi (e.g. +3.0 -
+               (-3.0) = 6.0 rad instead of -0.28), which would otherwise snap the
+               pose when a cone is re-observed across the wrap. */
             meas_diff(1) = normalizeAngle(meas_diff(1));
 
-            /* Mahalanobis gate: the normalized innovation d^2 = nu^T S^-1 nu
-               follows a chi-square distribution with 2 DOF (range, bearing).
-               A value above the 99% bound (9.21) means this observation is
-               grossly inconsistent with the matched landmark — almost always a
-               WRONG data association at loop closure. Applying it would snap the
-               pose, so reject the update. Only gated once the pose is anchored
-               (lap 2+); during lap 1 the pose is frozen and the map is still
-               forming, so we let all matches refine the landmarks. */
-            if (this->is_first_lap_completed)
+            if (!this->is_first_lap_completed)
             {
-                float maha = meas_diff.transpose() * S_inv * meas_diff;
-                if (maha > 9.21f)
-                {
-                    continue;
-                }
-            }
-            /* First lap: let the cones be mapped/refined, but do NOT let them move the
-               vehicle pose yet (sparse, immature map → noisy pose corrections). Anchor
-               only from lap 2, when the map is frozen and reliable. */
-            if (!this->is_first_lap_completed) {
-                K.topRows(3).setZero();
-            }
+                /* LAP 1: full-state EKF update on the active sub-block (pose +
+                   mapped landmarks; inactive landmarks are decoupled, so they are
+                   excluded from the products). Build/refine the map, but FREEZE
+                   the pose (zero its gain rows) — the map is still sparse and
+                   immature, so pose corrections would be noisy. */
+                const size_t na = 3 + 2 * this->landmark_count;
 
-            /* Update filter state (active part only). */
-            this->x_.head(na).noalias() += (K * meas_diff);
-            this->x_(2) = this->normalizeYaw(this->x_(2));
+                MatrixXf Fx_k_a = MatrixXf::Zero(5, na);
+                Fx_k_a.block(0,0,3,3) = Matrix3f::Identity();
+                Fx_k_a.block(3, 3 + 2*k, 2, 2) = Matrix2f::Identity();
 
-            /* Update filter covariance in O(na^2): P -= K * (Ht_k * P).
-               Equivalent to (I - K*Ht_k)*P but without forming the full
-               (I - K*Ht_k) matrix nor an n x n product. */
-            P_a.noalias() -= K * HtP;
+                MatrixXf Ht_k = ht_k * Fx_k_a;                  /* (2 x na) */
+                auto P_a = this->P_.topLeftCorner(na, na);
+
+                MatrixXf HtP = Ht_k * P_a;                      /* (2 x na) */
+                Matrix2f S = (HtP * Ht_k.transpose()) + this->Q_;
+                MatrixXf K = P_a * Ht_k.transpose() * S.inverse();
+
+                K.topRows(3).setZero();                         /* freeze pose */
+
+                this->x_.head(na).noalias() += (K * meas_diff);
+                this->x_(2) = this->normalizeYaw(this->x_(2));
+                P_a.noalias() -= K * HtP;
+            }
+            else
+            {
+                /* LAP 2+: RIGID-MAP localization update. The map is now a fixed,
+                   known reference: treat landmark k as a constant and update ONLY
+                   the 3-DoF pose. A clean pose-only update (rather than zeroing
+                   the landmark rows of a full-state gain) keeps P consistent — no
+                   asymmetric gain truncation — and fixes the global-rotation
+                   gauge, so the map neither drifts nor rotates over laps and the
+                   pose is not snapped by a contaminated gain. */
+                Matrix<float,2,3> H_p = ht_k.leftCols(3);
+                auto P_pp = this->P_.topLeftCorner(3,3);
+
+                Matrix<float,2,3> HpP = H_p * P_pp;             /* (2x3) */
+                Matrix2f S = (HpP * H_p.transpose()) + this->Q_;
+
+                /* No gate here: the Mahalanobis association gate above already
+                   validated this cone for lap 2+. */
+                Matrix<float,3,2> K_p = P_pp * H_p.transpose() * S.inverse();  /* (3x2) */
+
+                this->x_.head(3).noalias() += anchor_gain * (K_p * meas_diff);
+                this->x_(2) = this->normalizeYaw(this->x_(2));
+                P_pp.noalias() -= anchor_gain * (K_p * HpP);
+            }
 
         }
     }
-}
 
-/* Bump the visibility counter of every mapped landmark inside the sensor FOV. */
-void EKFOdom::updateLandmarkVisibility(const float max_range, const float half_fov_rad)
-{
-    for (size_t k = 0; k < this->landmark_count; k++)
+    /* ---- Batch (joint) measurement update --------------------------------
+       Fuse ALL cones associated this scan in a single joint EKF update instead
+       of only the last one. Applying M independent SEQUENTIAL updates per scan
+       shrinks P ~M-fold and drives the filter overconfident until it diverges;
+       a joint update instead linearises every cone at the SAME state and does
+       exactly ONE covariance reduction, so it uses all the measurement
+       information while staying consistent. */
+    if (this->batch_update_ && !batch_obs.empty())
     {
-        const float dx = this->x_(3 + 2*k) - this->x_(0);
-        const float dy = this->x_(4 + 2*k) - this->x_(1);
+        const size_t na = 3 + 2 * this->landmark_count;
 
-        /* Out of usable range -> not expected to be detected this scan. */
-        if ((dx*dx + dy*dy) > (max_range * max_range))
+        /* Per-cone Jacobian block (2x5: [pose | landmark k]), innovation, and an
+           individual Mahalanobis gate. Survivors are stacked below. */
+        struct ConeUpdate { size_t k; Matrix<float,2,5> Hb; Vector2f nu; };
+        std::vector<ConeUpdate> ups;
+        ups.reserve(batch_obs.size());
+
+        for (const auto &obs : batch_obs)
         {
-            continue;
+            const size_t kk = obs.first;
+
+            Vector2f d = this->x_.segment(3 + 2*kk, 2) - Vector2f(this->x_(0), this->x_(1));
+            float q = d.transpose() * d;
+            q = (q == 0.0f) ? __FLT_MIN__ : q;
+            const float sq = sqrt(q);
+
+            Vector2f exp_z(sq, normalizeAngle(atan2(d(1), d(0)) - this->x_(2)));
+
+            /* (1/q) * low-Jacobian, columns = [x, y, theta | m_kx, m_ky]. */
+            Matrix<float,2,5> Hb;
+            Hb << -sq*d(0), -sq*d(1),  0.0f,  sq*d(0),  sq*d(1),
+                      d(1),    -d(0),    -q,    -d(1),     d(0);
+            Hb /= q;
+
+            Vector2f nu = obs.second - exp_z;
+            nu(1) = normalizeAngle(nu(1));
+
+            /* No gate here: lap-2+ associations were already validated by the
+               Mahalanobis gate at association time (see correct() loop). */
+            ups.push_back({kk, Hb, nu});
         }
 
-        /* Outside the horizontal FOV -> not expected to be detected this scan. */
-        const float bearing = normalizeAngle(atan2(dy, dx) - this->x_(2));
-        if (fabs(bearing) > half_fov_rad)
+        const size_t m = ups.size();
+        if (m > 0)
         {
-            continue;
-        }
+            /* Stacked innovation nu_all (2m) and block-diagonal measurement noise
+               R (2m x 2m), common to both regimes. */
+            VectorXf nu_all = VectorXf::Zero(2*m);
+            MatrixXf R      = MatrixXf::Zero(2*m, 2*m);
+            for (size_t r = 0; r < m; r++)
+            {
+                nu_all.segment(2*r, 2)  = ups[r].nu;
+                R.block(2*r, 2*r, 2, 2) = this->Q_;
+            }
 
-        this->s_(k).incrementExpected();
+            if (!this->is_first_lap_completed)
+            {
+                /* LAP 1: full-state joint update — build/refine the map, freeze
+                   the pose. H is sparse: each cone touches pose + its landmark. */
+                auto P_a = this->P_.topLeftCorner(na, na);
+
+                MatrixXf H = MatrixXf::Zero(2*m, na);
+                for (size_t r = 0; r < m; r++)
+                {
+                    H.block(2*r, 0, 2, 3)              = ups[r].Hb.leftCols(3);
+                    H.block(2*r, 3 + 2*ups[r].k, 2, 2) = ups[r].Hb.rightCols(2);
+                }
+
+                MatrixXf HP = H * P_a;                           /* (2m x na)  */
+                MatrixXf S  = (HP * H.transpose()) + R;          /* (2m x 2m)  */
+                MatrixXf K  = P_a * H.transpose() * S.inverse(); /* (na x 2m)  */
+
+                K.topRows(3).setZero();                          /* freeze pose */
+
+                this->x_.head(na).noalias() += (K * nu_all);
+                this->x_(2) = this->normalizeYaw(this->x_(2));
+                P_a.noalias() -= K * HP;
+            }
+            else
+            {
+                /* LAP 2+: RIGID-MAP joint localization. Treat the map as fixed and
+                   update ONLY the pose, using just the pose columns of each
+                   Jacobian. Consistent P (3x3 block), no gauge drift, no snap from
+                   a truncated gain. */
+                auto P_pp = this->P_.topLeftCorner(3,3);
+
+                MatrixXf Hp = MatrixXf::Zero(2*m, 3);
+                for (size_t r = 0; r < m; r++)
+                {
+                    Hp.block(2*r, 0, 2, 3) = ups[r].Hb.leftCols(3);
+                }
+
+                MatrixXf HpP = Hp * P_pp;                        /* (2m x 3)   */
+                MatrixXf S   = (HpP * Hp.transpose()) + R;       /* (2m x 2m)  */
+                MatrixXf K_p = P_pp * Hp.transpose() * S.inverse(); /* (3 x 2m) */
+
+                this->x_.head(3).noalias() += anchor_gain * (K_p * nu_all);
+                this->x_(2) = this->normalizeYaw(this->x_(2));
+                P_pp.noalias() -= anchor_gain * (K_p * HpP);
+            }
+        }
     }
+
+    return associated;
 }
 
 /* Return current filter state */
@@ -339,6 +466,23 @@ MatrixXf EKFOdom::getFx() const {
 void EKFOdom::setFirstLapCompleted(const bool first_lap_completed)
 {
     this->is_first_lap_completed = first_lap_completed;
+}
+void EKFOdom::setBatchUpdate(const bool enable)
+{
+    this->batch_update_ = enable;
+}
+void EKFOdom::setAnchorRampScans(const size_t scans)
+{
+    this->anchor_ramp_scans_ = scans;
+}
+void EKFOdom::setAssocMahaGate(const float gate)
+{
+    this->assoc_maha_gate_ = gate;
+}
+void EKFOdom::setMotionNoise(const float pos, const float yaw)
+{
+    this->q_motion_pos_ = pos;
+    this->q_motion_yaw_ = yaw;
 }
 
 
@@ -395,6 +539,20 @@ void EKFOdom::setPose(const Vector3f pose)
     auto Pa = this->P_.topLeftCorner(na, na);
     Pa.topRows(3)  = (G * Pa.topRows(3)).eval();              /* rows: G * P    */
     Pa.leftCols(3) = (Pa.leftCols(3) * G.transpose()).eval(); /* cols: P * G^T  */
+
+    /* Additive motion process noise (the Q of the predict step). Inject pose
+       uncertainty proportional to how far the car moved this step, so P cannot
+       collapse to ~0 over the laps as cone corrections keep shrinking it.
+       Without it the filter grows overconfident in its FAST-LIMO-propagated
+       pose; then S = H P H^T + Q is tiny, the Mahalanobis association gate
+       rejects the very cones that would correct the accumulating drift, and the
+       map diverges in the late laps. Scaling with travelled distance/turn
+       (rather than a constant per-scan term) mirrors how odometry error
+       actually accumulates and is zero when the car is stopped. */
+    const float dtrans = std::sqrt(local_dx*local_dx + local_dy*local_dy);
+    this->P_(0,0) += this->q_motion_pos_ * dtrans;
+    this->P_(1,1) += this->q_motion_pos_ * dtrans;
+    this->P_(2,2) += this->q_motion_yaw_ * std::fabs(dtheta);
 
     /* Compose the relative motion onto the (cone-corrected) EKF pose mean, so the
        correction applied by correct() is preserved instead of overwritten. */
