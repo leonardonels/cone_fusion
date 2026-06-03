@@ -76,9 +76,6 @@ private:
   /* If true, the EKF fuses all cones of a scan in one joint update (vs. only the last) */
   bool batch_cone_update = false;
 
-  /* # cone-correction scans to ramp the pose anchor in from lap 2 (0 = instant snap) */
-  int anchor_ramp_scans = 0;
-
   /* Chi-square (2 DOF) gate for lap-2+ data association by Mahalanobis distance */
   double assoc_maha_gate = 9.21;
 

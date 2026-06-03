@@ -48,16 +48,13 @@ private:
 
     bool batch_update_ = false; /* If true, correct() fuses ALL cones associated in a scan in one joint EKF update instead of only the last one */
 
-    size_t anchor_ramp_scans_ = 0; /* # of correction scans over which the cone anchor ramps in from lap 2 (0 = instant snap) */
-    size_t anchor_scans_ = 0;      /* counter of correction scans elapsed since the anchor became active */
-
     float assoc_maha_gate_ = 9.21f; /* chi-square (2 DOF) gate for lap-2+ data association by Mahalanobis distance */
 
     float q_motion_pos_ = 0.0f; /* Additive process noise on x,y per metre travelled [m^2/m]. Keeps P from collapsing so the assoc gate stays honest. 0 = off. */
     float q_motion_yaw_ = 0.0f; /* Additive process noise on theta per radian turned [rad^2/rad]. 0 = off. */
 
 public:
-    EKFOdom(Vector2f process_noise, Vector3f measurement_noise, const float alpha);
+    EKFOdom(Vector2f process_noise, Vector3f measurement_noise, Vector2f motion_noise, const float alpha);
     virtual ~EKFOdom();
     
 
@@ -87,9 +84,7 @@ public:
 
     void setFirstLapCompleted(const bool first_lap_completed);
     void setBatchUpdate(const bool enable);
-    void setAnchorRampScans(const size_t scans);
     void setAssocMahaGate(const float gate);
-    void setMotionNoise(const float pos, const float yaw);
     void setActVel(const float vel);
     void setActAngVel(const float ang_vel);
     void setPose(const Vector3f pose);

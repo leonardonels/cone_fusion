@@ -6,7 +6,7 @@
 #include <utility>
 
 /* Constructor */
-EKFOdom::EKFOdom(Vector2f process_noise, Vector3f measurement_noise, const float alpha)
+EKFOdom::EKFOdom(Vector2f process_noise, Vector3f measurement_noise, Vector2f motion_noise, const float alpha)
 {
     /* Init number of threads */
     omp_set_num_threads(6);
@@ -45,6 +45,13 @@ EKFOdom::EKFOdom(Vector2f process_noise, Vector3f measurement_noise, const float
     {
         std::cerr << "R_ : \n" << this->R_ << "\n";
     }
+
+    /* Initialize motion (predict-step) process noise: additive pose covariance
+       per unit of travelled distance / turned angle (see setPose). */
+    this->q_motion_pos_ = motion_noise(0);
+    this->q_motion_yaw_ = motion_noise(1);
+
+    std::cerr << "M_:\n" << this->q_motion_pos_ << "    0\n   0 " << this->q_motion_yaw_ << "\n";
 
     /* Initialize max new cone dist */
     this->max_new_cone_dist = alpha;
@@ -109,19 +116,6 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
     /* Associations collected this scan for the batch (joint) update path:
        (landmark index k, observed (range, bearing)). Unused in single-cone mode. */
     std::vector<std::pair<size_t, Vector2f>> batch_obs;
-
-    /* Anchor ramp: over the first `anchor_ramp_scans_` correction scans of lap 2+,
-       scale the pose correction from ~0 up to 1, so the drift accumulated while
-       riding FAST-LIMO during lap 1 is realigned smoothly instead of snapping in
-       one step at the lap-1 -> lap-2 trust handoff. Stays 1.0 (no ramp) once
-       warmed up, or if disabled (anchor_ramp_scans_ == 0). */
-    float anchor_gain = 1.0f;
-    if (this->is_first_lap_completed && this->anchor_ramp_scans_ > 0)
-    {
-        this->anchor_scans_++;
-        const float a = (float)this->anchor_scans_ / (float)this->anchor_ramp_scans_;
-        anchor_gain = (a < 1.0f) ? a : 1.0f;
-    }
 
     // VectorXf new_state_update = VectorXf::Zero(2*N_CONES+3);
     // MatrixXf new_covariance_update = MatrixXf::Zero(2*N_CONES+3, 2*N_CONES+3);
@@ -316,9 +310,9 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                    validated this cone for lap 2+. */
                 Matrix<float,3,2> K_p = P_pp * H_p.transpose() * S.inverse();  /* (3x2) */
 
-                this->x_.head(3).noalias() += anchor_gain * (K_p * meas_diff);
+                this->x_.head(3).noalias() += (K_p * meas_diff);
                 this->x_(2) = this->normalizeYaw(this->x_(2));
-                P_pp.noalias() -= anchor_gain * (K_p * HpP);
+                P_pp.noalias() -= (K_p * HpP);
             }
 
         }
@@ -420,9 +414,9 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                 MatrixXf S   = (HpP * Hp.transpose()) + R;       /* (2m x 2m)  */
                 MatrixXf K_p = P_pp * Hp.transpose() * S.inverse(); /* (3 x 2m) */
 
-                this->x_.head(3).noalias() += anchor_gain * (K_p * nu_all);
+                this->x_.head(3).noalias() += (K_p * nu_all);
                 this->x_(2) = this->normalizeYaw(this->x_(2));
-                P_pp.noalias() -= anchor_gain * (K_p * HpP);
+                P_pp.noalias() -= (K_p * HpP);
             }
         }
     }
@@ -471,18 +465,9 @@ void EKFOdom::setBatchUpdate(const bool enable)
 {
     this->batch_update_ = enable;
 }
-void EKFOdom::setAnchorRampScans(const size_t scans)
-{
-    this->anchor_ramp_scans_ = scans;
-}
 void EKFOdom::setAssocMahaGate(const float gate)
 {
     this->assoc_maha_gate_ = gate;
-}
-void EKFOdom::setMotionNoise(const float pos, const float yaw)
-{
-    this->q_motion_pos_ = pos;
-    this->q_motion_yaw_ = yaw;
 }
 
 

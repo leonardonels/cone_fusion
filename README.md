@@ -296,14 +296,22 @@ formulations** of the update depending on the lap:
   landmarks too would let small biases **slowly rotate** the whole map after a few laps. From
   lap 2 no more cones are added.
 
-### Soft lap-1 → lap-2 handoff (`anchor_ramp_scans`)
-During lap 1 the pose accumulates the **FAST-LIMO drift** and $P_{pp}$ **grows** (no
-correction shrinks it). At the instant of transition to lap 2 the cones start correcting the
-pose with a large gain → the accumulated drift is corrected **in a single step** (a visible
-*snap*). With `generic.anchor_ramp_scans > 0` the pose correction is scaled by a factor
-$\alpha = \min(1, n/N)$ that grows from ~0 to 1 over the first $N$ correction scans of lap 2,
-spreading the realignment over several steps instead of just one. $0$ = instant snap
-(historical behavior).
+### Lap-1 → lap-2 handoff
+During lap 1 the pose accumulates the **FAST-LIMO drift** and $P_{pp}$ **grows** (the pose is
+frozen, so no correction shrinks it). At the transition to lap 2 the cones start correcting the
+pose: a large $P_{pp}$ means a high Kalman gain, so the pose is pulled onto the map — but that
+same correction sharply shrinks $P_{pp}$, so the next gain is smaller, and the realignment
+**self-tapers over a handful of scans** rather than a single jump. No explicit ramp is needed,
+and the motion-based process noise (§3) keeps $P_{pp}$ from then collapsing past a healthy floor.
+
+> **Removed: gain-scaled anchor ramp.** An earlier `anchor_ramp_scans` knob scaled the pose
+> correction by $\alpha=\min(1,n/N)$ over the first $N$ lap-2 scans. It was removed because
+> scaling the gain by $\alpha$ is **not a valid partial Kalman update**: it scaled both
+> $x\mathrel{+}=\alpha K\nu$ **and** $P\mathrel{-}=\alpha K(HP)$, so early in the ramp the pose
+> stayed nearly open-loop while $P$ was barely reduced — $P$ ran away (observed: $P_{yy}$
+> blowing up to ~2000 during the ramp window). If a softer handoff is ever needed, do it by
+> **inflating and decaying the measurement noise** ($R_{\text{eff}}=R/\alpha$), which keeps
+> $S$, $K$ and the $P$ update mutually consistent — not by scaling the gain.
 
 ### Active sub-block + $O(n_a^2)$ update
 The matrices are sized at $n=803$ but the unmapped landmarks are `INF·I` decoupled:
@@ -340,7 +348,6 @@ well if `N_CONES` is increased.
 | `generic.cones_pub_for_debug` | `true` → publishes the EKF's **live** map even after lap 1 (debug). `false` → publishes the **frozen** map. | Keep `false` in a race. In debug, remember the live one moves (the associated cones are still corrected by the filter). |
 | `generic.pub_input_cones_debug` | `true` → publishes on `input_cones_debug_topic` the raw input cones projected into the map frame with the current EKF pose (**red** markers). | Debug tool: the red ones should land on the mapped cones; if they "slide away" the pose is drifting. Keep `false` in a race. |
 | `generic.batch_cone_update` | Correction mode (§4.5). `false` → update on the last cone/scan only (default, cheap, stable). `true` → **joint** update over all associated cones (more information, less "nervous" pose). | Leave `false` as baseline; set `true` for the A/B test. If the pose becomes unstable in batch, raise `noises.proc_noise` (the $Q$ in $S$): the joint update is more aggressive because it fuses more measurements. |
-| `generic.anchor_ramp_scans` | Soft lap-1 → lap-2 handoff (§5). $N$ correction scans over which the pose is gradually realigned at the transition to lap 2. `0` → instant snap. **High** → smoother transition but slower realignment. | If you see a pose *kink* exactly at the lap change, set it to ~`30–80` (≈ a few seconds at the cone rate) and adjust. Not needed if lap-1 drift is small. |
 | `generic.is_colorblind` | `true` → all cones treated as yellow (color ignored in association). | Leave `true` if the color from the perceptor is unreliable. |
 | `generic.is_skidpad_mission` | Skidpad mode: publishes pose only, no cone markers. | `false` for missions with cone mapping. |
 | `N_CONES` (compile-time, `ekf_odom.hpp`) | Maximum landmark capacity. Increasing it enlarges the matrices (cost $\propto N$ on the inactive block, but `correct()` only works on $n_a$). | Raise if the track has more than ~400 cones. |

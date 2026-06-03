@@ -26,11 +26,9 @@ ConeFusion::ConeFusion() : rclcpp::Node("cone_fusion_node") {
   this->act_orientation.set__z(0.0);
 
   /* Create EKF SLAM filter object */
-  this->ekf_odom = std::make_shared<EKFOdom>(this->proc_noise, this->meas_noise, this->min_new_cone_distance);
+  this->ekf_odom = std::make_shared<EKFOdom>(this->proc_noise, this->meas_noise, this->motion_noise, this->min_new_cone_distance);
   this->ekf_odom->setBatchUpdate(this->batch_cone_update);
-  this->ekf_odom->setAnchorRampScans(this->anchor_ramp_scans > 0 ? static_cast<size_t>(this->anchor_ramp_scans) : 0);
   this->ekf_odom->setAssocMahaGate(static_cast<float>(this->assoc_maha_gate));
-  this->ekf_odom->setMotionNoise(this->motion_noise(0), this->motion_noise(1));
 
   /* Init mapped cones markers */
   this->initConesMarker(this->conesMarker);
@@ -69,9 +67,6 @@ void ConeFusion::loadParameters() {
   /* Joint (batch) cone update vs. single-cone-per-scan update */
   declare_parameter("generic.batch_cone_update", false);
 
-  /* Smooth the lap-1 -> lap-2 anchor handoff over N correction scans (0 = instant) */
-  declare_parameter("generic.anchor_ramp_scans", 0);
-
   /* Chi-square (2 DOF) gate for lap-2+ Mahalanobis data association */
   declare_parameter("generic.assoc_maha_gate", 9.21);
 
@@ -105,7 +100,6 @@ void ConeFusion::loadParameters() {
   get_parameter("generic.pub_input_cones_debug", this->pub_input_cones_debug);
 
   get_parameter("generic.batch_cone_update", this->batch_cone_update);
-  get_parameter("generic.anchor_ramp_scans", this->anchor_ramp_scans);
   get_parameter("generic.assoc_maha_gate", this->assoc_maha_gate);
 
   std::cout << "IS_SKIDPAD: " << this->is_skidpad_mission << "\n";

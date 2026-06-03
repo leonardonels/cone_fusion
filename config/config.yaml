@@ -28,11 +28,6 @@
       # true = joint update fusing all associated cones in one EKF step (A/B test).
       batch_cone_update: true
 
-      # Smooth the lap-1 -> lap-2 anchor handoff: ramp the pose correction in over
-      # this many cone-correction scans, so accumulated lap-1 drift is realigned
-      # gradually instead of snapping. 0 = instant, trust fast_limo.
-      anchor_ramp_scans: 100
-
       # Lap-2+ data association: a cone associates to the nearest mapped landmark
       # only if its Mahalanobis distance d^2 = nu^T S^-1 nu is below this gate
       # (chi-square, 2 DOF: 5.99=95%, 9.21=99%, 13.8=99.9%). Replaces the fixed
