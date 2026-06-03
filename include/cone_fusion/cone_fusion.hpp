@@ -70,6 +70,11 @@ private:
   /* Min number of time a cone has to be seen in order to map it */
   uint32_t cone_time_seen_th;
 
+  /* Sensor visibility model for cone false-positive rejection */
+  double lidar_max_range;    /* Max range [m] within which a mapped cone is expected to be detected */
+  double lidar_fov;          /* Horizontal field of view [deg] (full angle) */
+  double cone_confidence_th; /* Min detected/expected ratio [0..1] to publish a mapped cone */
+
   /* EKF Parameters */
   Vector2f proc_noise;
   Vector3f meas_noise;

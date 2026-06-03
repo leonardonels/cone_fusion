@@ -35,6 +35,7 @@ public:
     }
 
     ++cone_info.at(color);
+    ++times_detected_;
   }
 
   /* Return the color of the most seen cone */
@@ -60,6 +61,18 @@ public:
     return *output_cone;
   }
 
+  /* Detection / visibility counters for false-positive rejection. A landmark is
+     "detected" each time it is associated to an observation (setColor) and
+     "expected" each scan it lies within the sensor FOV/range. The ratio
+     detected/expected is ~1 for a real cone (seen on nearly every pass it is
+     visible) and stays low for a ghost that only matches sporadically across
+     laps, which a plain cumulative count cannot distinguish. */
+  void incrementExpected() { ++times_expected_; }
+  uint32_t getDetected() const { return times_detected_; }
+  uint32_t getExpected() const { return times_expected_; }
+
 private:
   std::map<ColorId, uint32_t> cone_info;
+  uint32_t times_detected_ = 0;  /* total associations (detections) of this landmark */
+  uint32_t times_expected_ = 0;  /* scans this landmark was within sensor FOV/range */
 };

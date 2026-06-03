@@ -64,6 +64,11 @@ void ConeFusion::loadParameters() {
   declare_parameter("generic.is_skidpad_mission", false);
   declare_parameter("generic.cones_pub_for_debug", false);
 
+  /* Sensor visibility model for cone false-positive rejection */
+  declare_parameter("generic.lidar_max_range", 12.0);
+  declare_parameter("generic.lidar_fov", 120.0);
+  declare_parameter("generic.cone_confidence_th", 0.3);
+
   /* Declare Sensor Noise parameters */
   declare_parameter<std::vector<double>>("noises.proc_noise", std::vector<double>{0.0, 0.0});
   declare_parameter<std::vector<double>>("noises.meas_noise", std::vector<double>{0.0, 0.0, 0.0});
@@ -93,7 +98,11 @@ void ConeFusion::loadParameters() {
   get_parameter("generic.is_skidpad_mission", this->is_skidpad_mission);
   get_parameter("generic.cones_pub_for_debug", this->cones_pub_for_debug);
 
-  RCLCPP_INFO(this->get_logger(), "IS_SKIDPAD: %u", this->is_skidpad_mission);
+  get_parameter("generic.lidar_max_range", this->lidar_max_range);
+  get_parameter("generic.lidar_fov", this->lidar_fov);
+  get_parameter("generic.cone_confidence_th", this->cone_confidence_th);
+
+  std::cout << "IS_SKIDPAD: " << this->is_skidpad_mission << "\n";
 
   /* Get Sensor Noise parameters */
   get_parameter("noises.proc_noise", tmp_proc_noise);
@@ -132,8 +141,8 @@ void ConeFusion::initConesMarker(visualization_msgs::msg::Marker &cones) {
 
 /* Callbacks */
 
-void ConeFusion::conesCallback(
-    const visualization_msgs::msg::Marker::SharedPtr cones_data) {
+void ConeFusion::conesCallback(const visualization_msgs::msg::Marker::SharedPtr cones_data) 
+{
   /* If corrected cons are created -> Skip callback */
   // if(this->corrected_cones_created)
   // {
@@ -168,25 +177,44 @@ void ConeFusion::conesCallback(
 
   free(z);
 
+  /* Update per-landmark visibility (expected-detection) counters for this scan,
+     using the current pose estimate. Together with the per-detection counter,
+     this drives the detected/expected confidence ratio below. */
+  this->ekf_odom->updateLandmarkVisibility(
+      static_cast<float>(this->lidar_max_range),
+      static_cast<float>((this->lidar_fov * M_PI / 180.0) / 2.0));
+
   /* Publish cones */
   if (!this->corrected_cones_created || this->cones_pub_for_debug) {
     size_t mapped_cones = this->ekf_odom->getActMappedLandmarks();
     conesMarker.points.reserve(mapped_cones);
     conesMarker.colors.reserve(mapped_cones);
 
+    /* Snapshot state and signatures once (getters return by value). */
+    SignatureVector sigs = this->ekf_odom->getSignatures();
+    VectorXf state = this->ekf_odom->getState();
+
     for (size_t i = 0; i < mapped_cones; i++) {
-      /* Get how many times the i-th cone has been seen */
-      std::pair<ColorId, uint32_t> cone_info =
-          this->ekf_odom->getSignatures()(i).getConeColorAndCount();
-      // uint16_t seen_threshold = cone_time_seen_th *
-      // (this->race_status.current_lap);
+      /* Get the most-voted color and how many times the i-th cone was seen */
+      std::pair<ColorId, uint32_t> cone_info = sigs(i).getConeColorAndCount();
 
-      // RCLCPP_INFO(this->get_logger(), "SEEN TH: %u", seen_threshold);
-
-      /* If less than 5 times, don't map it */
-      if (cone_info.second < cone_time_seen_th)
+      /* Absolute floor: a cone must be detected at least cone_time_seen_th
+         times before it is eligible at all. */
+      const uint32_t detected = sigs(i).getDetected();
+      if (detected < cone_time_seen_th)
         continue;
-      Vector2f cone = this->ekf_odom->getState().segment(3 + (i * 2), 2);
+
+      /* Detection-ratio gate: reject false positives that accumulate a few
+         detections spread thinly over many laps. A real cone is detected on
+         (almost) every pass it is within the sensor FOV/range, so its
+         detected/expected ratio is near 1; a ghost cone's ratio stays low. */
+      const uint32_t expected = sigs(i).getExpected();
+      const float confidence =
+          (expected > 0) ? (float)detected / (float)expected : 0.0f;
+      if (confidence < this->cone_confidence_th)
+        continue;
+
+      Vector2f cone = state.segment(3 + (i * 2), 2);
       geometry_msgs::msg::Point p;
       std_msgs::msg::ColorRGBA c;
       this->setConeColor(c, static_cast<uint8_t>(cone_info.first));
@@ -238,8 +266,8 @@ void ConeFusion::conesCallback(
 //   this->act_orientation.set__w(q.getW());
 // }
 
-void ConeFusion::fastLimoDataCallback(
-    const nav_msgs::msg::Odometry::SharedPtr fast_limo_data) {
+void ConeFusion::fastLimoDataCallback(const nav_msgs::msg::Odometry::SharedPtr fast_limo_data) 
+{
   // RCLCPP_INFO(this->get_logger(), "FAST LIMO CB");
   tf2::Quaternion q;
   q.setX(fast_limo_data->pose.pose.orientation.x);
@@ -306,7 +334,6 @@ void ConeFusion::fastLimoDataCallback(
 void ConeFusion::pubConesMarkers(visualization_msgs::msg::Marker &cones) {
   cones.header.stamp = this->now();
   this->conesPositionsMarkerPub->publish(cones);
-  std::cout << "Published " << cones.points.size() << " cones.\n";
 }
 
 void ConeFusion::updatePose() {

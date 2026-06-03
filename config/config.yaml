@@ -20,16 +20,21 @@
 
       # gps_speed_topic: "/speed/gps"
       race_status_topic: "/planning/race_status"
-      enable_logging: false
+      enable_logging: true
       cone_time_seen_th: 4
       is_skidpad_mission: false
       cones_pub_for_debug: true
 
+      # False-positive rejection: a mapped cone is published only if it is
+      # detected on a large enough fraction of the passes it is actually visible.
+      lidar_max_range: 20.0      # Max range [m] within which a cone is expected to be detected
+      lidar_fov: 180.0           # Horizontal field of view [deg] (full angle)
+      cone_confidence_th: 0.3    # Min detected/expected ratio [0..1] to publish a cone
+
     frequency:
       imu_fs: 100
-      # gps_fs: 10
 
     noises:
-      proc_noise:  [0.8, 0.2]        # Sigma range [m] and bearing [rad]
-      meas_noise:  [0.02, 0.02, 0.07]  # Gaussian error of the odometry X,Y position [m] and Yaw angle [rad]
-      min_new_cone_distance: 2.0      # Minimum distance to create new cone
+      proc_noise:  [0.3, 0.1]             # Sigma range [m] and bearing [rad]
+      # meas_noise:  [0.02, 0.02, 0.07]     # Gaussian error of the odometry X,Y position [m] and Yaw angle [rad]
+      min_new_cone_distance: 2.0          # Minimum distance to create new cone

@@ -192,6 +192,59 @@ dove $Q$ = `proc_noise` (vedi §6, nomenclatura non standard). L'update di $\mat
 come $\mathbf{P} - K(H\mathbf{P})$, algebricamente identico a $(I-KH)\mathbf{P}$ ma in $O(n_a^2)$
 invece di $O(n^3)$ (§5).
 
+**Wrapping dell'innovazione.** La componente di bearing dell'innovazione $\nu = z - \hat z$
+viene normalizzata a $[-\pi,\pi]$: sia $\phi_i$ sia $\hat z_\theta$ sono già normalizzati
+singolarmente, ma la loro **differenza** può cadere a cavallo di $\pm\pi$ (es. $+3.0-(-3.0)=6.0$
+rad invece di $-0.28$). Senza il wrapping, un cono ri-osservato attraverso la discontinuità
+angolare — tipico alla chiusura del giro — inietterebbe un'innovazione enorme e spuria che fa
+"scattare" la posa.
+
+### 4.4 Gating di associazione (Mahalanobis)
+
+Prima di applicare l'update, l'innovazione è testata con la distanza di Mahalanobis normalizzata,
+che segue una chi-quadro a 2 gradi di libertà (range + bearing):
+
+$$
+d^2 = \nu^\top S^{-1} \nu, \qquad \nu = z - \hat z
+$$
+
+Se $d^2 > 9.21$ (bound al 99% per 2 DoF) l'osservazione è grossolanamente incoerente con il
+landmark associato — quasi sempre un'**associazione errata** (es. alla chiusura del giro, quando
+si ri-osservano i primi coni con il drift accumulato) — e l'update viene **scartato**
+(`continue`). Il gate è attivo **solo dal 2° giro** (`is_first_lap_completed`): durante il 1°
+giro la posa è comunque congelata ($K_{0:3}=0$) e la mappa si sta ancora formando, quindi tutte
+le associazioni vengono lasciate raffinare i landmark. Poiché il gate può solo **scartare**
+update, non restringe mai $\mathbf{P}$ in modo improprio.
+
+### 4.5 Reiezione dei falsi positivi (rapporto rilevazioni/visibilità)
+
+Un contatore cumulativo di "quante volte un cono è stato visto" non distingue **5 rilevazioni
+in un giro** (cono reale) da **5 rilevazioni sparse su 6 giri** (falso positivo): cresce in modo
+monotono e, su molti giri, anche i ghost finiscono per superare la soglia. Per questo ogni
+landmark mantiene **due** contatori (`color_logic.hpp`):
+
+- `detected` — incrementato ad ogni associazione (in `setColor`, §4.1);
+- `expected` — incrementato ad ogni scan in cui il landmark cade dentro il FOV/range del sensore.
+
+`expected` è aggiornato da `updateLandmarkVisibility(max_range, half_fov)`, chiamato una volta
+per scan in `conesCallback` dopo `correct()`: per ogni cono mappato si predice range/bearing
+dalla posa corrente e, se $\rho < \texttt{lidar\_max\_range}$ e $|\phi| < \texttt{lidar\_fov}/2$,
+si fa `expected++`.
+
+Un cono è pubblicato solo se supera **entrambe** le soglie:
+
+$$
+\texttt{detected} \ge \texttt{cone\_time\_seen\_th}
+\quad\wedge\quad
+\frac{\texttt{detected}}{\texttt{expected}} \ge \texttt{cone\_confidence\_th}
+$$
+
+Il rapporto $\approx 1$ per un cono reale (rilevato quasi ad ogni passaggio in cui è visibile)
+e resta basso per un ghost che combacia solo sporadicamente — es. visto 5 volte ma in FOV 50+
+volte su 6 giri $\Rightarrow 0.1$, scartato. Con `cones_pub_for_debug: true` il gate è
+rivalutato ad ogni scan su tutti i giri, quindi il rapporto si stringe man mano che si accumula
+evidenza.
+
 ---
 
 ## 5. Decisioni di design e ottimizzazioni
@@ -236,7 +289,10 @@ bene se si aumenta `N_CONES`.
 | `noises.proc_noise` `[var_range, var_bearing]` | Quanto il filtro si fida dei coni. È la $Q$ in $S=HPH^\top+Q$. **Grande** → coni meno credibili → correzioni dolci, ancoraggio lento, meno jitter. **Piccolo** → correzioni aggressive, ancoraggio rapido, più jitter e rischio di divergenza con associazioni errate. | Parti da `[0.1, 0.1]`. Se i coni "vibrano"/la posa scatta dal 2° giro, **aumenta**. Se l'ancora è troppo lenta a recuperare il drift, **diminuisci**. `var_bearing` in rad²: 0.1 ≈ σ≈18°, piuttosto largo. |
 | `noises.meas_noise` `[x,y,yaw]` | $R$ di `predict()`. **Inerte** finché `predict()` non viene collegato. | Lasciare com'è; rilevante solo se si attiva il modello a velocità. |
 | `noises.min_new_cone_distance` ($\alpha$) [m] | Soglia di associazione / creazione nuovo cono. **Grande** → meno coni nuovi, associazione più aggressiva (rischio di fondere coni distinti). **Piccolo** → più coni (rischio duplicati da rumore). | Impostare **sotto la metà** della spaziatura minima tra coni adiacenti in pista e **sopra** il rumore di posizione per-frame. Default `2.0`. |
-| `generic.cone_time_seen_th` | Quante volte un cono dev'essere osservato prima di entrare nella mappa pubblicata/congelata. **Alto** → mappa più pulita ma coni che compaiono tardi. | `4` è un buon compromesso; alza se vedi coni spuri, abbassa se la mappa si popola troppo lentamente. |
+| `generic.cone_time_seen_th` | Soglia **assoluta minima** di rilevazioni perché un cono sia eleggibile alla pubblicazione (combinata con il rapporto `cone_confidence_th`, §4.5). **Alto** → mappa più pulita ma coni che compaiono tardi. | `4` è un buon compromesso; alza se vedi coni spuri, abbassa se la mappa si popola troppo lentamente. |
+| `generic.lidar_max_range` [m] | Range entro cui un cono è considerato "atteso" (`expected++`) nel rapporto di confidenza (§4.5). **Troppo grande** → coni reali oltre la portata reale del percettore accumulano `expected` senza `detected` e vengono scartati per errore. | Impostare al range entro cui il **percettore** rileva i coni in modo affidabile, **non** al range massimo grezzo del LiDAR. |
+| `generic.lidar_fov` [deg] | FOV orizzontale (angolo pieno) usato per il test di visibilità (§4.5). | Impostare al FOV effettivo del percettore di coni. |
+| `generic.cone_confidence_th` `[0..1]` | Soglia minima del rapporto `detected/expected` per pubblicare un cono (reiezione FP, §4.5). **Alto** → mappa più pulita ma rischio di scartare coni reali ai bordi; **basso** → più permissivo. | Parti da `0.3`; alza verso `0.5–0.6` se i ghost passano ancora. Se vengono scartati coni reali ai bordi, **prima** restringi `lidar_max_range`/`lidar_fov`. |
 | `generic.cones_pub_for_debug` | `true` → pubblica la mappa **viva** dell'EKF anche dopo il 1° giro (debug). `false` → pubblica la mappa **congelata**. | Tieni `false` in gara. In debug ricorda che la viva si muove (i coni associati sono ancora corretti dal filtro). |
 | `generic.is_colorblind` | `true` → tutti i coni trattati come gialli (colore ignorato nell'associazione). | Lasciare `true` se il colore dal percettore non è affidabile. |
 | `generic.is_skidpad_mission` | Modalità skidpad: pubblica solo posa, niente marker coni. | `false` per missioni con mappatura coni. |
@@ -286,10 +342,13 @@ bene se si aumenta `N_CONES`.
                       └─ updatePose()         : pubblica /Odometry da getState() (alto rate)
 
 /clusters ──────────▶ conesCallback
-                      ├─ correct()            : associazione NN + update Kalman su blocco attivo
-                      │                          (1° giro: K[pose]=0 → solo mapping;
-                      │                           2° giro: K pieno → ancora la posa, no nuovi coni)
-                      └─ pubConesMarkers()    : mappa viva (debug/1° giro) o congelata
+                      ├─ correct()                 : associazione NN + wrapping innovazione +
+                      │                               gate Mahalanobis + update Kalman (blocco attivo)
+                      │                               (1° giro: K[pose]=0 → solo mapping;
+                      │                                2° giro: K pieno → ancora la posa, no nuovi coni)
+                      ├─ updateLandmarkVisibility() : expected++ per i coni mappati dentro FOV/range
+                      └─ pubConesMarkers()         : pubblica i coni con detected ≥ cone_time_seen_th
+                                                      e detected/expected ≥ cone_confidence_th
 
 /planning/race_status ─▶ raceStatusCallback   : current_lap → setFirstLapCompleted(lap>1)
 ```

@@ -28,6 +28,7 @@ EKFOdom::EKFOdom(Vector2f process_noise, Vector3f measurement_noise, const float
         // this->Q_(i,i) = pow(process_noise(i), 2);
         this->Q_(i,i) = process_noise(i);
     }
+    
     std::cerr << "Q_ : \n" << this->Q_ << "\n";
 
     /* Initialize Measurement noise covariance */
@@ -38,8 +39,10 @@ EKFOdom::EKFOdom(Vector2f process_noise, Vector3f measurement_noise, const float
         this->R_(i,i) = measurement_noise(i);
     }
 
-    std::cerr << "R_ : \n" << this->R_ << "\n";
-
+    if(measurement_noise[0] != 0.0 || measurement_noise[1] != 0.0 || measurement_noise[2] != 0.0)
+    {
+        std::cerr << "R_ : \n" << this->R_ << "\n";
+    }
 
     /* Initialize max new cone dist */
     this->max_new_cone_dist = alpha;
@@ -228,9 +231,33 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
             /* Innovation covariance S (2x2) and Kalman gain K (na x 2). */
             MatrixXf HtP = Ht_k * P_a;                          /* (2 x na) */
             Matrix2f S = (HtP * Ht_k.transpose()) + this->Q_;
-            MatrixXf K = P_a * Ht_k.transpose() * S.inverse();  /* (na x 2) */
+            Matrix2f S_inv = S.inverse();
+            MatrixXf K = P_a * Ht_k.transpose() * S_inv;        /* (na x 2) */
 
             Vector2f meas_diff = Vector2f(z[i](0), z[i](1)) - exp_z_k;
+            /* Wrap the bearing innovation to [-pi, pi]. Both terms are
+               individually normalized, but their difference can straddle the
+               +/-pi boundary (e.g. +3.0 - (-3.0) = 6.0 rad instead of -0.28).
+               Without this, a cone re-observed across the wrap (typical at loop
+               closure) injects a huge spurious innovation that snaps the pose. */
+            meas_diff(1) = normalizeAngle(meas_diff(1));
+
+            /* Mahalanobis gate: the normalized innovation d^2 = nu^T S^-1 nu
+               follows a chi-square distribution with 2 DOF (range, bearing).
+               A value above the 99% bound (9.21) means this observation is
+               grossly inconsistent with the matched landmark — almost always a
+               WRONG data association at loop closure. Applying it would snap the
+               pose, so reject the update. Only gated once the pose is anchored
+               (lap 2+); during lap 1 the pose is frozen and the map is still
+               forming, so we let all matches refine the landmarks. */
+            if (this->is_first_lap_completed)
+            {
+                float maha = meas_diff.transpose() * S_inv * meas_diff;
+                if (maha > 9.21f)
+                {
+                    continue;
+                }
+            }
             /* First lap: let the cones be mapped/refined, but do NOT let them move the
                vehicle pose yet (sparse, immature map → noisy pose corrections). Anchor
                only from lap 2, when the map is frozen and reliable. */
@@ -248,6 +275,31 @@ void EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
             P_a.noalias() -= K * HtP;
 
         }
+    }
+}
+
+/* Bump the visibility counter of every mapped landmark inside the sensor FOV. */
+void EKFOdom::updateLandmarkVisibility(const float max_range, const float half_fov_rad)
+{
+    for (size_t k = 0; k < this->landmark_count; k++)
+    {
+        const float dx = this->x_(3 + 2*k) - this->x_(0);
+        const float dy = this->x_(4 + 2*k) - this->x_(1);
+
+        /* Out of usable range -> not expected to be detected this scan. */
+        if ((dx*dx + dy*dy) > (max_range * max_range))
+        {
+            continue;
+        }
+
+        /* Outside the horizontal FOV -> not expected to be detected this scan. */
+        const float bearing = normalizeAngle(atan2(dy, dx) - this->x_(2));
+        if (fabs(bearing) > half_fov_rad)
+        {
+            continue;
+        }
+
+        this->s_(k).incrementExpected();
     }
 }
 

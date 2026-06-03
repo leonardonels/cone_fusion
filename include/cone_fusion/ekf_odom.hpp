@@ -79,6 +79,18 @@ public:
     void setPose(const Vector3f pose);
     void setPoseCovariance(const Vector3f pos_cov);
 
+    /**
+     * Increment the "expected" (visibility) counter of every mapped landmark
+     * that currently falls within the sensor FOV/range, given the current pose
+     * estimate. Paired with the per-detection counter, this yields a
+     * detected/expected ratio used to reject false-positive cones that only
+     * match sporadically across laps.
+     *
+     * @param max_range:     max range [m] within which a cone is expected to be detected
+     * @param half_fov_rad:  half of the horizontal FOV [rad]
+     */
+    void updateLandmarkVisibility(const float max_range, const float half_fov_rad);
+
 
     inline float euclideanDistance(float x1, float x2, float y1, float y2) {
       return sqrt(((x2 - x1)*(x2 - x1)) + ((y2 - y1)*(y2 - y1)));
