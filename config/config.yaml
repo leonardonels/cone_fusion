@@ -1,4 +1,4 @@
-/cone_fusion_node:
+/cone_fused_node:
   ros__parameters:
     generic:
       is_colorblind: true

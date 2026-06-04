@@ -1,6 +1,6 @@
-#include <cone_fusion/cone_fusion.hpp>
+#include <cone_fused/cone_fused.hpp>
 
-ConeFusion::ConeFusion() : rclcpp::Node("cone_fusion_node") {
+ConeFusion::ConeFusion() : rclcpp::Node("cone_fused_node") {
   /* Load node parameters */
   this->loadParameters();
 

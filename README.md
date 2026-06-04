@@ -1,4 +1,4 @@
-# cone_fusion
+# cone_fused
 
 Cone-based EKF-SLAM that fuses **FAST-LIMO/FAST-LIO** odometry (used as a *relative*
 motion source) with the track's **static cones** (used as landmarks) to anchor the
