@@ -80,6 +80,10 @@ private:
      false, lap 2+ keeps refining pose AND landmarks (continuous SLAM, legacy) */
   bool freeze_map = true;
 
+  /* If true (default), lap 1 freezes the pose (full FAST-LIMO trust, map only); if
+     false, lap 1 runs full SLAM so cones also anchor LIMO drift while mapping */
+  bool freeze_pose_first_lap = true;
+
   /* Chi-square (2 DOF) gate for lap-2+ data association by Mahalanobis distance */
   double assoc_maha_gate = 9.21;
 

@@ -281,7 +281,16 @@ formulations** of the update depending on the lap:
 - **Lap 1** (`¬ is_first_lap_completed`): **full-state** EKF-SLAM update on the active
   sub-block (pose + landmarks), but with the **pose rows of the gain zeroed** ($K_{0:3}=0$).
   This way the cones **build and refine the map** while the pose follows FAST-LIMO in pure
-  relative mode (pose corrections from a sparse map would be noisy).
+  relative mode (pose corrections from a sparse map would be noisy). This pose freeze is the
+  default and is controlled by `generic.freeze_pose_first_lap: true`. Setting it to **`false`**
+  keeps the pose gain (no zeroing), so lap 1 runs **full EKF-SLAM**: the cones also correct the
+  pose while mapping, anchoring FAST-LIMO drift as the map is built (most effective at loop
+  closure, when you re-see the start cones). Use `false` when LIMO drifts noticeably within a
+  single lap and bakes a **smeared/duplicated map** (re-seen cones drifting past
+  `min_new_cone_distance` spawn duplicates instead of associating). The cost: a wrong data
+  association in the still-sparse lap-1 map now corrupts the **pose**, not just adds a stray
+  landmark — and lap 1 has no Mahalanobis gate (it uses the Euclidean new-cone gate), so the
+  protection is weaker. Keep `true` if lap-1 LIMO is clean.
 - **From lap 2** (`current_lap > 1`): **pose-only** update (localization on a known map). The
   landmark is treated as a **constant** and only the $3\times3$ pose block is updated:
   $$
@@ -358,6 +367,7 @@ well if `N_CONES` is increased.
 | `generic.cones_pub_for_debug` | `true` → publishes the EKF's **live** map even after lap 1 (debug). `false` → publishes the **frozen** map. | Keep `false` in a race. In debug, remember the live one moves (the associated cones are still corrected by the filter). |
 | `generic.pub_input_cones_debug` | `true` → publishes on `input_cones_debug_topic` the raw input cones projected into the map frame with the current EKF pose (**red** markers). | Debug tool: the red ones should land on the mapped cones; if they "slide away" the pose is drifting. Keep `false` in a race. |
 | `generic.batch_cone_update` | Correction mode (§4.5). `false` → update on the last cone/scan only (default, cheap, stable). `true` → **joint** update over all associated cones (more information, less "nervous" pose). | Leave `false` as baseline; set `true` for the A/B test. If the pose becomes unstable in batch, raise `noises.proc_noise` (the $Q$ in $S$): the joint update is more aggressive because it fuses more measurements. |
+| `generic.freeze_pose_first_lap` | Lap-1 pose handling (§5). `true` (default) → **freeze the pose**: trust FAST-LIMO completely, cones only build the map. `false` → **full SLAM in lap 1**: cones also correct the pose while mapping, so LIMO drift is anchored as the map is built (esp. at loop closure). | Keep `true` if lap-1 LIMO is clean. Switch to `false` if you see the map **smear/duplicate** during lap 1 (LIMO drift baked in). Watch out: with `false`, a wrong association in the sparse early map can corrupt the pose (no Mahalanobis gate in lap 1) — if lap 1 gets *worse*, revert. |
 | `generic.freeze_map` | Map handling from lap 2 (§5). `true` (default) → **rigid map**: pose-only localization, landmarks fixed, gauge locked (no slow map rotation). `false` → **continuous SLAM**: keep correcting pose *and* landmark positions (legacy; refines the map but can let it slowly rotate over laps). No new cones are added after lap 1 either way. | Keep `true` for multi-lap races (gauge stability). Use `false` only for A/B tests or short runs where map refinement matters more than long-horizon stability. If you enable it and the map starts rotating after a few laps, that's the expected gauge drift — switch back to `true`. |
 | `generic.is_colorblind` | `true` → all cones treated as yellow (color ignored in association). | Leave `true` if the color from the perceptor is unreliable. |
 | `generic.is_skidpad_mission` | Skidpad mode: publishes pose only, no cone markers. | `false` for missions with cone mapping. |

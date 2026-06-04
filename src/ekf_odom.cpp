@@ -288,8 +288,8 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                 Matrix2f S = (HtP * Ht_k.transpose()) + this->Q_;
                 MatrixXf K = P_a * Ht_k.transpose() * S.inverse();
 
-                if (!this->is_first_lap_completed)
-                    K.topRows(3).setZero();                     /* freeze pose (lap 1 only) */
+                if (!this->is_first_lap_completed && this->freeze_pose_first_lap_)
+                    K.topRows(3).setZero();                     /* freeze pose (lap 1, full LIMO trust) */
 
                 this->x_.head(na).noalias() += (K * meas_diff);
                 this->x_(2) = this->normalizeYaw(this->x_(2));
@@ -396,8 +396,8 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                 MatrixXf S  = (HP * H.transpose()) + R;          /* (2m x 2m)  */
                 MatrixXf K  = P_a * H.transpose() * S.inverse(); /* (na x 2m)  */
 
-                if (!this->is_first_lap_completed)
-                    K.topRows(3).setZero();                      /* freeze pose (lap 1 only) */
+                if (!this->is_first_lap_completed && this->freeze_pose_first_lap_)
+                    K.topRows(3).setZero();                      /* freeze pose (lap 1, full LIMO trust) */
 
                 this->x_.head(na).noalias() += (K * nu_all);
                 this->x_(2) = this->normalizeYaw(this->x_(2));
@@ -475,6 +475,10 @@ void EKFOdom::setBatchUpdate(const bool enable)
 void EKFOdom::setFreezeMap(const bool enable)
 {
     this->freeze_map_ = enable;
+}
+void EKFOdom::setFreezePoseFirstLap(const bool enable)
+{
+    this->freeze_pose_first_lap_ = enable;
 }
 void EKFOdom::setAssocMahaGate(const float gate)
 {
