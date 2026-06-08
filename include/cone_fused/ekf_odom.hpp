@@ -6,6 +6,11 @@
 
 #include <iostream>
 
+#ifdef USE_CUDA
+#include <cone_fused/ekf_cuda.hpp>
+#include <memory>
+#endif
+
 #define N_CONES 400           /* This constant is the initial cones number. */
 #define INF 1e1       /* 1e10 Constant value to represent Infinite */
 
@@ -57,8 +62,20 @@ private:
     float q_motion_pos_ = 0.0f; /* Additive process noise on x,y per metre travelled [m^2/m]. Keeps P from collapsing so the assoc gate stays honest. 0 = off. */
     float q_motion_yaw_ = 0.0f; /* Additive process noise on theta per radian turned [rad^2/rad]. 0 = off. */
 
+#ifdef USE_CUDA
+    /* Resident-state GPU backend. When active, the device holds the
+       authoritative P_ and x_; the host x_ keeps a synced mirror of the active
+       head (pose + active landmarks) and P_ keeps a synced 3x3 pose block — the
+       only parts the CPU touches (data association, markers, publishing). */
+    std::unique_ptr<EkfCudaBackend> gpu_;
+    bool use_gpu_ = false;
+
+    /* Refresh the host mirrors (x_ head(na) and P_ 3x3) from the device. */
+    void syncFromDevice();
+#endif
+
 public:
-    EKFOdom(Vector2f process_noise, Vector3f measurement_noise, Vector2f motion_noise, const float alpha);
+    EKFOdom(Vector2f process_noise, Vector3f measurement_noise, Vector2f motion_noise, const float alpha, int eigen_threads = 1);
     virtual ~EKFOdom();
     
 

@@ -11,8 +11,36 @@ if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 20)
 endif()
 
+# Host (C++) flags only — guarded so they are NOT passed to nvcc, which does not
+# understand -march=native / -Wpedantic directly.
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic -march=native -O3)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall>
+                      $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+                      $<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>
+                      $<$<COMPILE_LANGUAGE:CXX>:-march=native>
+                      $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+endif()
+
+# ----------------------------------------------------------------------------
+# Optional GPU (CUDA) EKF backend.
+#   cmake ... -DUSE_CUDA=ON      -> compile src/ekf_cuda.cu, link cuBLAS/cuSOLVER,
+#                                   define USE_CUDA so EKFOdom routes the heavy
+#                                   update onto the GPU.
+#   (default OFF)                -> pure CPU build, identical to before, with no
+#                                   CUDA toolchain dependency (the debug backend).
+# ----------------------------------------------------------------------------
+option(USE_CUDA "Build the resident-state GPU EKF backend (needs CUDA toolkit)" ON)
+set(CONE_FUSED_CUDA_ARCH "87" CACHE STRING "CUDA arch for the GPU backend (Orin = 87)")
+
+if(USE_CUDA)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  # Default arch for every target so CMP0104 doesn't complain about the
+  # (non-CUDA) executable target that links the CUDA-enabled library.
+  set(CMAKE_CUDA_ARCHITECTURES "${CONE_FUSED_CUDA_ARCH}")
+  message(STATUS "cone_fused: GPU backend ENABLED (CUDA arch ${CONE_FUSED_CUDA_ARCH})")
+else()
+  message(STATUS "cone_fused: GPU backend disabled (CPU-only build)")
 endif()
 
 # find dependencies
@@ -32,10 +60,15 @@ include_directories(
 )
 
 # Build Node class
-add_library(${PROJECT_NAME} 
+set(CONE_FUSED_SOURCES
   src/${PROJECT_NAME}.cpp
   src/ekf_odom.cpp
 )
+if(USE_CUDA)
+  list(APPEND CONE_FUSED_SOURCES src/ekf_cuda.cu)
+endif()
+
+add_library(${PROJECT_NAME} ${CONE_FUSED_SOURCES})
 
 ament_target_dependencies(${PROJECT_NAME}
   rclcpp
@@ -51,6 +84,19 @@ target_link_libraries(${PROJECT_NAME}
   Eigen3::Eigen
   OpenMP::OpenMP_CXX
 )
+
+if(USE_CUDA)
+  set_target_properties(${PROJECT_NAME} PROPERTIES
+    CUDA_ARCHITECTURES "${CONE_FUSED_CUDA_ARCH}"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+  target_compile_definitions(${PROJECT_NAME} PUBLIC USE_CUDA)
+  target_link_libraries(${PROJECT_NAME}
+    CUDA::cudart
+    CUDA::cublas
+    CUDA::cusolver
+  )
+endif()
 
 add_executable(${PROJECT_NAME}_node src/${PROJECT_NAME}_node.cpp)
 

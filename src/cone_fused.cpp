@@ -26,7 +26,7 @@ ConeFusion::ConeFusion() : rclcpp::Node("cone_fused_node") {
   this->act_orientation.set__z(0.0);
 
   /* Create EKF SLAM filter object */
-  this->ekf_odom = std::make_shared<EKFOdom>(this->proc_noise, this->meas_noise, this->motion_noise, this->min_new_cone_distance);
+  this->ekf_odom = std::make_shared<EKFOdom>(this->proc_noise, this->meas_noise, this->motion_noise, this->min_new_cone_distance, this->eigen_threads);
   this->ekf_odom->setBatchUpdate(this->batch_cone_update);
   this->ekf_odom->setFreezeMap(this->freeze_map);
   this->ekf_odom->setFreezePoseFirstLap(this->freeze_pose_first_lap);
@@ -78,6 +78,9 @@ void ConeFusion::loadParameters() {
   /* Chi-square (2 DOF) gate for lap-2+ Mahalanobis data association */
   declare_parameter("generic.assoc_maha_gate", 9.21);
 
+  /* Eigen/OpenMP thread count for the CPU linear algebra (default 1). */
+  declare_parameter("generic.eigen_threads", 1);
+
   /* Declare Sensor Noise parameters */
   declare_parameter<std::vector<double>>("noises.proc_noise", std::vector<double>{0.0, 0.0});
   declare_parameter<std::vector<double>>("noises.meas_noise", std::vector<double>{0.0, 0.0, 0.0});
@@ -111,6 +114,7 @@ void ConeFusion::loadParameters() {
   get_parameter("generic.freeze_map", this->freeze_map);
   get_parameter("generic.freeze_pose_first_lap", this->freeze_pose_first_lap);
   get_parameter("generic.assoc_maha_gate", this->assoc_maha_gate);
+  get_parameter("generic.eigen_threads", this->eigen_threads);
 
   std::cout << "IS_SKIDPAD: " << this->is_skidpad_mission << "\n";
 

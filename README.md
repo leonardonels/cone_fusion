@@ -340,6 +340,41 @@ update uses the form $\mathbf{P}-K(H\mathbf{P})$ ($O(n_a^2)$) instead of the ful
 $(I-KH)\mathbf{P}$ ($O(n^3)$). This is essential on a Jetson Orin (modest CPU IPC), and scales
 well if `N_CONES` is increased.
 
+### GPU (CUDA) backend (`USE_CUDA`)
+Even with the $O(n_a^2)$ form, the **lap-1 full-state update** is the bottleneck on the Orin
+Nano: `freeze_map` cannot help it (the cheap rigid pose-only path only applies from lap 2 —
+lap 1 always runs the dense full-state update while the map grows to $n_a\approx 803$). It costs
+~15 ms/scan on a single CPU core, and ~50–80 ms with the old 6-thread Eigen setting (at these
+matrix sizes multithreaded GEMM mostly adds fork/join jitter). An optional **resident-state GPU
+backend** offloads the heavy linear algebra:
+
+- **Compile-time switch** (cuBLAS/cuSOLVER vs Eigen), *not* a runtime parameter. Built only with
+  `-DUSE_CUDA=ON` (**default ON**). `OFF` → the original CPU-only build with no CUDA dependency —
+  the debug backend, "like before".
+- `EkfCudaBackend` (`include/cone_fused/ekf_cuda.hpp`, `src/ekf_cuda.cu`) keeps **$\mathbf{P}$
+  ($n\times n$) and $\mathbf{x}$ resident on the device** for the whole run (allocated/initialised
+  once; `thrust::device_vector`, RAII). The $n\times n$ covariance never crosses the bus.
+- **On device** (cuBLAS + cuSOLVER): the batch full-state update
+  ($HP=H\mathbf{P}$, $S=HP\,H^\top+R$, solve $S\,K^\top=HP$, $\mathbf{x}\mathrel{+}=K\nu$,
+  $\mathbf{P}\mathrel{-}=K\,HP$), the `setPose` motion propagation ($\mathbf{P}$ pose strips
+  through $G$, additive noise, pose compose), and the `setPoseCovariance` increments.
+- **On CPU** (cheap, branchy): data association, color logic, marker building. `EKFOdom` keeps
+  **host mirrors** of $\mathbf{x}$ (active head) and the $3\times3$ pose block of $\mathbf{P}$ —
+  the only parts the CPU reads — refreshed by `syncFromDevice()`. Per scan only tiny slices move:
+  $H/R/\nu$ up; pose, $3\times3$ cov and landmark means down.
+- In GPU mode all corrections go through the **joint (batch)** path by necessity (the device holds
+  the authoritative $\mathbf{P}$, so a single-cone CPU update would read a stale host copy) — it
+  implies batch fusion regardless of `batch_cone_update`.
+
+Verified on the Orin Nano Super (sm_87): GPU vs Eigen relative error ~$10^{-4}$; full-map
+($n_a=803$) update **median ~1.3 ms** vs ~15 ms single-thread CPU. **Pin the clocks** for the
+tail and throughput (target <1 ms): `sudo nvpmodel -m 0 && sudo jetson_clocks`.
+
+```bash
+colcon build --packages-select cone_fused                                # GPU backend (default)
+colcon build --packages-select cone_fused --cmake-args -DUSE_CUDA=OFF    # CPU-only (debug)
+```
+
 ### A single publication source
 - `/Odometry` is published **only** by `fastLimoDataCallback` (FAST-LIMO rate, high), reading
   the EKF state `getState().head(3)` — **not** the raw LIMO pose.
@@ -371,6 +406,8 @@ well if `N_CONES` is increased.
 | `generic.freeze_map` | Map handling from lap 2 (§5). `true` (default) → **rigid map**: pose-only localization, landmarks fixed, gauge locked (no slow map rotation). `false` → **continuous SLAM**: keep correcting pose *and* landmark positions (legacy; refines the map but can let it slowly rotate over laps). No new cones are added after lap 1 either way. | Keep `true` for multi-lap races (gauge stability). Use `false` only for A/B tests or short runs where map refinement matters more than long-horizon stability. If you enable it and the map starts rotating after a few laps, that's the expected gauge drift — switch back to `true`. |
 | `generic.is_colorblind` | `true` → all cones treated as yellow (color ignored in association). | Leave `true` if the color from the perceptor is unreliable. |
 | `generic.is_skidpad_mission` | Skidpad mode: publishes pose only, no cone markers. | `false` for missions with cone mapping. |
+| `generic.eigen_threads` | Eigen/OpenMP threads for the **CPU** linear algebra. Default `1`. At these matrix sizes multithreaded GEMM mostly adds fork/join jitter (p99 latency blows up at 6 threads on the 6-core SoC). With the GPU backend the heavy work is offloaded, so this only matters for a CPU-only build. | Keep `1`. Try `2` only when profiling a CPU-only (`-DUSE_CUDA=OFF`) build on a full-size map; never the old `6`. |
+| `USE_CUDA` (compile-time, CMake) | **Build flag**, not a yaml param. `ON` (default) → GPU backend (needs CUDA toolkit). `OFF` → CPU-only build, no CUDA dependency (debug). See §5. | `colcon build --packages-select cone_fused --cmake-args -DUSE_CUDA=OFF` for the CPU debug build. |
 | `N_CONES` (compile-time, `ekf_odom.hpp`) | Maximum landmark capacity. Increasing it enlarges the matrices (cost $\propto N$ on the inactive block, but `correct()` only works on $n_a$). | Raise if the track has more than ~400 cones. |
 
 ---

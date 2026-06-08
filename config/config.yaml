@@ -53,7 +53,14 @@
       # (chi-square, 2 DOF: 5.99=95%, 9.21=99%, 13.8=99.9%). Replaces the fixed
       # Euclidean radius so the capture region adapts to pose uncertainty. Raise
       # to keep correcting under larger drift; lower to reject more aggressively.
-      assoc_maha_gate: 13.8 
+      assoc_maha_gate: 13.8
+
+      # Eigen/OpenMP threads for the CPU linear algebra. Default 1: at these
+      # matrix sizes multithreaded GEMM mostly adds fork/join jitter (p99 latency
+      # blows up at 6 threads on the Orin's 6-core SoC). With the GPU backend
+      # (-DUSE_CUDA=ON) the heavy work is offloaded, so this only affects the CPU
+      # (debug) build. Try 2 if profiling a CPU-only build of a full-size map.
+      eigen_threads: 1
 
     noises:
       proc_noise:  [0.7, 0.3]             # Sigma range [m] and bearing [rad]

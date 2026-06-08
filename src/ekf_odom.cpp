@@ -6,13 +6,17 @@
 #include <utility>
 
 /* Constructor */
-EKFOdom::EKFOdom(Vector2f process_noise, Vector3f measurement_noise, Vector2f motion_noise, const float alpha)
+EKFOdom::EKFOdom(Vector2f process_noise, Vector3f measurement_noise, Vector2f motion_noise, const float alpha, int eigen_threads)
 {
-    /* Init number of threads */
-    omp_set_num_threads(6);
-    Eigen::setNbThreads(6);
+    /* Eigen/OpenMP thread count. Default 1: at the matrix sizes here multithreaded
+       GEMM mostly adds fork/join jitter (p99 latency blows up at 6 threads on the
+       Orin's 6-core SoC) — and with the GPU backend the heavy work is offloaded
+       anyway. Configurable via the `eigen_threads` node parameter for CPU tuning. */
+    if (eigen_threads < 1) eigen_threads = 1;
+    omp_set_num_threads(eigen_threads);
+    Eigen::setNbThreads(eigen_threads);
 
-    std::cerr << "Num threads: " << Eigen::nbThreads() << "\n";
+    std::cerr << "Eigen threads: " << Eigen::nbThreads() << "\n";
     
     /* Initialize state vector */
     this->x_ = VectorXf::Zero(2 * N_CONES + 3);
@@ -63,7 +67,41 @@ EKFOdom::EKFOdom(Vector2f process_noise, Vector3f measurement_noise, Vector2f mo
     /* Initialize Fx_k*/
     this->Fx_k = MatrixXf::Zero(5, 2*N_CONES+3);
     this->Fx_k.block(0,0,3,3) = Matrix3f::Identity();
+
+#ifdef USE_CUDA
+    /* Bring up the resident-state GPU backend. It initialises the device P and x
+       identically to the CPU constructor above (P = blockdiag(I3, INF*I), x=0),
+       so the host mirrors (this->x_, this->P_) are already consistent with the
+       device. max_two_m = 256 -> up to 128 cones/scan before an (automatic)
+       scratch grow. On any failure we fall back to the CPU path. */
+    this->gpu_ = std::make_unique<EkfCudaBackend>(2 * N_CONES + 3, 256, INF);
+    this->use_gpu_ = this->gpu_->ok();
+    if (this->use_gpu_)
+        std::cerr << "EKFOdom: CUDA backend ACTIVE (resident GPU state)\n";
+    else
+        std::cerr << "EKFOdom: CUDA backend init FAILED (" << this->gpu_->lastError()
+                  << ") -> CPU fallback\n";
+#endif
 }
+
+#ifdef USE_CUDA
+void EKFOdom::syncFromDevice() {
+    /* Pull the small host mirrors back from the authoritative device state. */
+    float pose3[3];
+    this->gpu_->downloadPose3(pose3);
+    this->x_(0) = pose3[0];
+    this->x_(1) = pose3[1];
+    this->x_(2) = pose3[2];
+    if (this->landmark_count > 0)
+        this->gpu_->downloadLandmarks(this->x_.data() + 3,
+                                      static_cast<int>(this->landmark_count));
+    float cov3[3];
+    this->gpu_->downloadPoseCov3(cov3);
+    this->P_(0, 0) = cov3[0];
+    this->P_(1, 1) = cov3[1];
+    this->P_(2, 2) = cov3[2];
+}
+#endif
 
 
 /* EKF Predict step function */
@@ -199,6 +237,13 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                 k = this->landmark_count;
                 this->landmark_count++;
                 this->x_.segment(3 + (2*k), 2) = tmp_cone;
+#ifdef USE_CUDA
+                /* Mirror the new landmark mean onto the resident device state.
+                   Its covariance is already INF on the device (pre-initialised),
+                   matching the host P_. */
+                if (this->use_gpu_)
+                    this->gpu_->insertLandmark(static_cast<int>(k), tmp_cone(0), tmp_cone(1));
+#endif
                 ColorLogic c;
                 c.setColor(static_cast<uint32_t>(z[i][2]));
                 this->s_(k) = c;
@@ -212,7 +257,16 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
 
         // std::cerr << "EKF INDEX: " << i << " k is: " << k << "\n";
         associated++;   /* reached only by observations that passed association */
-        if (this->batch_update_)
+
+        /* The GPU backend keeps the authoritative P_ on the device, so EVERY
+           covariance-modifying update must go through the joint (batch) path that
+           is offloaded; the single-cone CPU update would read/write a stale host
+           P_. Hence collect into batch when the GPU is active too. */
+        bool collect_batch = this->batch_update_;
+#ifdef USE_CUDA
+        collect_batch = collect_batch || this->use_gpu_;
+#endif
+        if (collect_batch)
         {
             /* Defer: collect this association. The joint update over all cones
                is applied once after the loop (see batch block below). */
@@ -329,7 +383,11 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
        a joint update instead linearises every cone at the SAME state and does
        exactly ONE covariance reduction, so it uses all the measurement
        information while staying consistent. */
-    if (this->batch_update_ && !batch_obs.empty())
+    bool do_batch = this->batch_update_;
+#ifdef USE_CUDA
+    do_batch = do_batch || this->use_gpu_;   /* GPU always uses the joint path */
+#endif
+    if (do_batch && !batch_obs.empty())
     {
         const size_t na = 3 + 2 * this->landmark_count;
 
@@ -392,16 +450,43 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                     H.block(2*r, 3 + 2*ups[r].k, 2, 2) = ups[r].Hb.rightCols(2);
                 }
 
-                MatrixXf HP = H * P_a;                           /* (2m x na)  */
-                MatrixXf S  = (HP * H.transpose()) + R;          /* (2m x 2m)  */
-                MatrixXf K  = P_a * H.transpose() * S.inverse(); /* (na x 2m)  */
+                const bool freeze_pose =
+                    (!this->is_first_lap_completed && this->freeze_pose_first_lap_);
 
-                if (!this->is_first_lap_completed && this->freeze_pose_first_lap_)
-                    K.topRows(3).setZero();                      /* freeze pose (lap 1, full LIMO trust) */
+#ifdef USE_CUDA
+                if (this->use_gpu_)
+                {
+                    /* Offload the O(na^2 m) update onto the resident device state.
+                       H, R, nu_all are column-major contiguous (Eigen default),
+                       so they map straight onto cuBLAS. */
+                    if (!this->gpu_->batchUpdateFullState(
+                            static_cast<int>(na), H.data(), R.data(),
+                            nu_all.data(), static_cast<int>(2*m), freeze_pose))
+                    {
+                        std::cerr << "EKFOdom: GPU batch update failed: "
+                                  << this->gpu_->lastError() << "\n";
+                    }
+                    /* device updated x_head and P (no yaw wrap on device): refresh
+                       host mirrors, wrap yaw on host, push the pose back. */
+                    this->syncFromDevice();
+                    this->x_(2) = this->normalizeYaw(this->x_(2));
+                    float p3[3] = { this->x_(0), this->x_(1), this->x_(2) };
+                    this->gpu_->uploadPose3(p3);
+                }
+                else
+#endif
+                {
+                    MatrixXf HP = H * P_a;                           /* (2m x na)  */
+                    MatrixXf S  = (HP * H.transpose()) + R;          /* (2m x 2m)  */
+                    MatrixXf K  = P_a * H.transpose() * S.inverse(); /* (na x 2m)  */
 
-                this->x_.head(na).noalias() += (K * nu_all);
-                this->x_(2) = this->normalizeYaw(this->x_(2));
-                P_a.noalias() -= K * HP;
+                    if (freeze_pose)
+                        K.topRows(3).setZero();                      /* freeze pose (lap 1, full LIMO trust) */
+
+                    this->x_.head(na).noalias() += (K * nu_all);
+                    this->x_(2) = this->normalizeYaw(this->x_(2));
+                    P_a.noalias() -= K * HP;
+                }
             }
             else
             {
@@ -424,6 +509,22 @@ size_t EKFOdom::correct(const Vector3f *z, const size_t act_cones_detected) {
                 this->x_.head(3).noalias() += (K_p * nu_all);
                 this->x_(2) = this->normalizeYaw(this->x_(2));
                 P_pp.noalias() -= (K_p * HpP);
+
+#ifdef USE_CUDA
+                /* The rigid update touches ONLY the 3x3 pose block and the pose
+                   mean — both valid host mirrors — so it is computed on the host
+                   above and the result pushed back to the resident device P/x. */
+                if (this->use_gpu_)
+                {
+                    float p3[3] = { this->x_(0), this->x_(1), this->x_(2) };
+                    this->gpu_->uploadPose3(p3);
+                    Matrix3f Pm = this->P_.topLeftCorner(3,3);
+                    float P33[9] = { Pm(0,0), Pm(0,1), Pm(0,2),
+                                     Pm(1,0), Pm(1,1), Pm(1,2),
+                                     Pm(2,0), Pm(2,1), Pm(2,2) };
+                    this->gpu_->uploadPoseBlock3x3(P33);
+                }
+#endif
             }
         }
     }
@@ -536,9 +637,6 @@ void EKFOdom::setPose(const Vector3f pose)
     G(1,2) =  dwx;   /* d f_y / d theta =  cos(theta)*lx - sin(theta)*ly =  dwx */
 
     const size_t na = 3 + 2 * this->landmark_count;
-    auto Pa = this->P_.topLeftCorner(na, na);
-    Pa.topRows(3)  = (G * Pa.topRows(3)).eval();              /* rows: G * P    */
-    Pa.leftCols(3) = (Pa.leftCols(3) * G.transpose()).eval(); /* cols: P * G^T  */
 
     /* Additive motion process noise (the Q of the predict step). Inject pose
        uncertainty proportional to how far the car moved this step, so P cannot
@@ -550,15 +648,39 @@ void EKFOdom::setPose(const Vector3f pose)
        (rather than a constant per-scan term) mirrors how odometry error
        actually accumulates and is zero when the car is stopped. */
     const float dtrans = std::sqrt(local_dx*local_dx + local_dy*local_dy);
-    this->P_(0,0) += this->q_motion_pos_ * dtrans;
-    this->P_(1,1) += this->q_motion_pos_ * dtrans;
-    this->P_(2,2) += this->q_motion_yaw_ * std::fabs(dtheta);
+    const float add_xx  = this->q_motion_pos_ * dtrans;
+    const float add_yy  = this->q_motion_pos_ * dtrans;
+    const float add_yaw = this->q_motion_yaw_ * std::fabs(dtheta);
 
-    /* Compose the relative motion onto the (cone-corrected) EKF pose mean, so the
-       correction applied by correct() is preserved instead of overwritten. */
-    this->x_(0) += dwx;
-    this->x_(1) += dwy;
-    this->x_(2)  = normalizeYaw(etheta + dtheta);
+#ifdef USE_CUDA
+    if (this->use_gpu_)
+    {
+        /* Propagate P pose strips + noise and compose the pose mean on the
+           resident device state, then refresh the host mirrors. */
+        const float Grm[9] = { G(0,0), G(0,1), G(0,2),
+                               G(1,0), G(1,1), G(1,2),
+                               G(2,0), G(2,1), G(2,2) };
+        this->gpu_->motionPropagate(static_cast<int>(na), Grm,
+                                    dwx, dwy, dtheta, add_xx, add_yy, add_yaw);
+        this->syncFromDevice();
+    }
+    else
+#endif
+    {
+        auto Pa = this->P_.topLeftCorner(na, na);
+        Pa.topRows(3)  = (G * Pa.topRows(3)).eval();              /* rows: G * P    */
+        Pa.leftCols(3) = (Pa.leftCols(3) * G.transpose()).eval(); /* cols: P * G^T  */
+
+        this->P_(0,0) += add_xx;
+        this->P_(1,1) += add_yy;
+        this->P_(2,2) += add_yaw;
+
+        /* Compose the relative motion onto the (cone-corrected) EKF pose mean, so
+           the correction applied by correct() is preserved instead of overwritten. */
+        this->x_(0) += dwx;
+        this->x_(1) += dwy;
+        this->x_(2)  = normalizeYaw(etheta + dtheta);
+    }
 
     this->prev_limo_pose_ = pose;
 }
@@ -579,6 +701,25 @@ void EKFOdom::setPoseCovariance(const Vector3f pos_cov)
        then shrinks it back when cones anchor the pose. The increment is clamped
        to >= 0 since LIMO's covariance can occasionally drop (e.g. its own
        relocalisation), which must not shrink the EKF covariance here. */
+#ifdef USE_CUDA
+    if (this->use_gpu_)
+    {
+        float inc[3];
+        for (size_t i = 0; i < 3; i++)
+        {
+            float d = pos_cov(i) - this->prev_limo_cov_(i);
+            inc[i] = (d > 0.0f) ? d : 0.0f;
+        }
+        this->gpu_->addPoseCovDiag(inc[0], inc[1], inc[2]);
+        float cov3[3];
+        this->gpu_->downloadPoseCov3(cov3);
+        this->P_(0,0) = cov3[0];
+        this->P_(1,1) = cov3[1];
+        this->P_(2,2) = cov3[2];
+        this->prev_limo_cov_ = pos_cov;
+        return;
+    }
+#endif
     for (size_t i = 0; i < 3; i++)
     {
         float d = pos_cov(i) - this->prev_limo_cov_(i);

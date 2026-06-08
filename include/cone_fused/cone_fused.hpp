@@ -87,6 +87,9 @@ private:
   /* Chi-square (2 DOF) gate for lap-2+ data association by Mahalanobis distance */
   double assoc_maha_gate = 9.21;
 
+  /* Eigen/OpenMP thread count for the CPU linear algebra (default 1). */
+  int eigen_threads = 1;
+
   /* EKF Parameters */
   Vector2f proc_noise;
   Vector3f meas_noise;
